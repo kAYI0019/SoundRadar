@@ -77,7 +77,7 @@ class ParentWidget(QtWidgets.QWidget):
         # update the color of the selected zone
         # color is a (1,3) array containing the RGB colors
         # position is an int giving the clocklike position
-        self.popframes[position]['shape'].popup_fillColor =  QtGui.QColor(color[0],color[1],color[2])
+        self.popframes[position]['shape'].popup_fillColor =  QtGui.QColor(int(color[0]), int(color[1]), int(color[2]))
         self.update()
     def setBackgroundcolor(self):
         self.p = QtWidgets.QWidget.palette(self)
@@ -325,17 +325,50 @@ prevmax = np.zeros(12) # initialize the "previous max" value
 redfactor = 5 #reduction factor if no upper value recorded
 refreshtime = 0.1 # time between two refresh
 
+def find_device_auto(search_keywords, device_type='input'):
+    """Automatically find device by searching through keyword list"""
+    devices = sd.query_devices()
+    
+    # Try each keyword
+    for keyword in search_keywords:
+        keyword_lower = keyword.lower()
+        for i, device in enumerate(devices):
+            device_name = device['name'].lower()
+            max_input = device.get('max_input_channels', 0)
+            
+            if keyword_lower in device_name:
+                if device_type == 'input' and max_input > 0:
+                    return i, device
+                elif device_type == 'any':
+                    return i, device
+    
+    return None, None
+
 if __name__ == "__main__":
     q = queue.Queue()
     app = QtWidgets.QApplication(sys.argv)
     mainwindow = ParentWidget()
     mainwindow.resize(500, 500)
     mainwindow.show()
-    print(sd.query_devices()) # print all devices available
-    #device_id = input('device id:') # if we want user to select device
+    
+    # 자동으로 디바이스 찾기 시도
+    search_keywords = ['CABLE Output', 'VB-Audio Virtual Cable', 'VB-Audio']
+    device_id, found_device = find_device_auto(search_keywords, 'input')
+    
+    if device_id is not None:
+        print(f"✓ Device found automatically: {found_device['name']} (ID: {device_id})")
+        device_info = found_device
+    else:
+        # Manual input if device not found automatically
+        print(sd.query_devices()) # print all devices available
+        device_id = int(input('device id:')) # if we want user to select device
+        device_info = sd.query_devices(device_id, 'input') # retrieve device infos
 
-    device_id=38 # input device to process -> should be commented out if previous line is active :o)
-    device_info = sd.query_devices(device_id, 'input') # retrieve device infos
+    #device_id=38 # input device to process -> should be commented out if previous line is active :o)
+    
+    # Update channel count based on actual device
+    n_chans = device_info['max_input_channels']
+    n_channel = n_chans
 
 
     stream = sd.InputStream(dtype=np.int32, device=device_id, channels=device_info['max_input_channels'],samplerate=device_info['default_samplerate'], callback=audio_callback)

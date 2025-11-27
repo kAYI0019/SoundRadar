@@ -1,6 +1,8 @@
 # soundRadar
 
-A 3D audio visualization tool that detects directional sound from any PC audio source and displays it in real-time.
+Real-time 360° directional audio radar using virtual surround sound.
+
+A 3D audio visualization tool that detects directional sound from any PC audio source and displays it in real time.
 
 > This project is modified from `soundRadar` by nmatton  
 > Original: https://github.com/nmatton/soundRadar  
