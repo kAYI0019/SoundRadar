@@ -1,38 +1,27 @@
-# soundRadar : A simple sound radar in Python
+# soundRadar
 
-> Design is ugly, precision is poor and code quality is average... but it works :)
+A 3D audio visualization tool that detects directional sound from any PC audio source and displays it in real-time.
 
-This is a Python 3+ program that process and show in real-time the 7.1 sound origin.
+> This project is modified from `soundRadar` by nmatton  
+> Original: https://github.com/nmatton/soundRadar  
+> License: GPL-3.0 — see [LICENSE](./LICENSE) for details.
 
-![image](https://user-images.githubusercontent.com/6585327/129367458-2405b3b0-0d26-42fc-a6ef-a5da786c9297.png)
+---
 
-## How to use ?
+## 🔧 Installation & Setup
 
-1. Download [VB-Cable](https://vb-audio.com/Cable/)
-2. Install it
-3. Reboot PC
-4. Go to sound settings
-5. Open Playback tab
-6. Set CABLE Input as default
-7. Click on Configure
-8. Set sound to 7.1 surround and enable all speakers
-9. Go to Recording tab
-10. Click on CABLE Output and click Properties
-11. Go to Listen tab
-12. Check Listen to this device
-13. Set your normal playback device
-14. run `python soundRadar.py`
-15. Enjoy
+1. Download and install [VB-Cable](https://vb-audio.com/Cable/)
+2. Reboot your PC
+3. Open **Sound Settings**
+4. Go to **Playback** tab
+5. Set **CABLE Input** as default device
+6. Click **Configure**
+7. Set sound to **7.1 Surround** and enable all speakers
+8. Go to **Recording** tab
+9. Select **CABLE Output** → **Properties**
+10. Under **Listen** tab, enable **Listen to this device**
+11. Set your main audio output device
+12. Run the application:
 
-(list inspired from a project that also may interest you : [Canetis Radar](https://github.com/SamuelTulach/CanetisRadar)
-
-# Usefull links
-
-- [Canetis Radar](https://github.com/SamuelTulach/CanetisRadar)
-- [Sonic Radar](https://rog.asus.com/technology/rog-sound-innovations/sonic-radar/)
-- list to be updated... later (and later is often... never :) )
-
-# Contributing
-
-You are pleased to send PR, I will take time to have a look on it
-You can also [donate to let me drink a beer tonight ;)](https://www.paypal.com/donate/?hosted_button_id=JYUZVFAGMGXD4)
+```sh
+python soundRadar.py
