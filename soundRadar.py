@@ -16,6 +16,8 @@ class TranslucentWidget(QtWidgets.QWidget):
         self.popup_fillColor = QtGui.QColor(240, 240, 240, 255)
         self.popup_penColor = QtGui.QColor(200, 200, 200, 255)
         self.position = position
+        
+        self.strength = 0.0
     def resizeEvent(self, event):
         s = self.size()
         popup_width = 300
@@ -36,22 +38,68 @@ class TranslucentWidget(QtWidgets.QWidget):
         # This method is drawing the contents of your window.
         # get current window size
         s = self.size()
-        qp = QtGui.QPainter()
-        qp.begin(self)
+        w, h = s.width(), s.height()
+        cx, cy = w / 2, h / 2
+
+        qp = QtGui.QPainter(self)
         qp.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        # drawpopup
-        qp.setPen(self.popup_penColor)
-        qp.setBrush(self.popup_fillColor)
-        self.polygon = self.createPoly(self.position,150,20)
-        qp.drawPolygon(self.polygon)
+
+        strength = getattr(self, "strength", 0.0)
+        strength = max(0.0, min(1.0, float(strength)))
+
+        # according to the strength, set the color and transparency
+        # very low: light green, low: dark green, mid: yellow, high: orange/red
+        if strength < 0.25:
+            # very small sound: inside, light green, almost transparent
+            r, g, b, alpha = 60, 200, 60, 40
+        elif strength < 0.5:
+            # small to medium: dark green
+            r, g, b, alpha = 40, 255, 80, 90
+        elif strength < 0.75:
+            # middle: yellow
+            r, g, b, alpha = 255, 220, 60, 150
+        else:
+            # very large sound: orange/red, opaque
+            r, g, b, alpha = 255, 120, 40, 220
+
+        color = QtGui.QColor(r, g, b, alpha)
+
+        # according to the strength, set the pen width/radius
+        pen_width = 2 + 10 * strength  # 2~12px
+        qp.setPen(QtGui.QPen(color, pen_width, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+        qp.setBrush(QtCore.Qt.NoBrush)
+
+        # according to the screen size, set the radius
+        # smaller sound is closer to the center, larger sound is much further from the center
+        min_r = min(w, h) * 0.18  # closer to the center
+        max_r = min(w, h) * 0.40  # a bit further from the center
+        radius = min_r + (max_r - min_r) * strength
+
+        rect = QtCore.QRectF(cx - radius, cy - radius, 2 * radius, 2 * radius)
+
+        start_deg = -105 + self.position * 30 + 180
+        span_deg = 30
+        start_angle = int(start_deg * 16)
+        span_angle = int(span_deg * 16)
+
+        qp.drawArc(rect, start_angle, span_angle)
         qp.end()
 
 
 class ParentWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super(ParentWidget, self).__init__(parent)
+        self.setWindowFlags(
+            QtCore.Qt.FramelessWindowHint
+            | QtCore.Qt.WindowStaysOnTopHint
+            | QtCore.Qt.Tool
+        )
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)               
         self.popframes = {}
         self._popflag = False
+        self.global_peak = 0.1
+
         for i in range(12):
             self.create_shape(position=i)
         for item in self.popframes:
@@ -77,7 +125,36 @@ class ParentWidget(QtWidgets.QWidget):
         # update the color of the selected zone
         # color is a (1,3) array containing the RGB colors
         # position is an int giving the clocklike position
-        self.popframes[position]['shape'].popup_fillColor =  QtGui.QColor(int(color[0]), int(color[1]), int(color[2]))
+        r = int(color[0])
+        g = int(color[1])
+        b = int(color[2])
+        r = max(0, min(255, r))
+        g = max(0, min(255, g))
+        b = max(0, min(255, b))
+
+        try:
+            raw = float(prevmax[position])
+            raw = max(0.0, min(1.0, raw))
+            # according to the strength mode, set the processing method
+            from math import pow as mpow
+            if STRENGTH_MODE == 1:
+                # mode 1: only emphasize the strongest direction among all
+                # track the recent global peak (slowly decreasing)
+                self.global_peak = max(self.global_peak * 0.9, raw, 1e-3)
+                ratio = raw / (self.global_peak + 1e-6)
+                # only keep the values around the largest value (0.6 or higher) and almost 0 for the rest
+                if ratio < 0.6:
+                    strength = 0.0
+                else:
+                    strength = (ratio - 0.6) / 0.4  # 0.6→0, 1.0→1
+            else:
+                # mode 2: show multiple directions, but the strongest direction is much more prominent
+                # square the values to make smaller values smaller and larger values stay the same
+                strength = raw * raw
+            strength = max(0.0, min(1.0, strength))
+            self.popframes[position]['shape'].strength = strength
+        except Exception:
+            self.popframes[position]['shape'].strength = 0.0      
         self.update()
     def setBackgroundcolor(self):
         self.p = QtWidgets.QWidget.palette(self)
@@ -133,7 +210,8 @@ def updateRadar(radarObject):
         time.sleep(refreshtime)
         maxValues = getMaxSound(n_channel)
         maxValues = initfilter(maxValues, minThreshold)
-        print(maxValues[[0,1,4,5,6,7]]*100) # this will generate a lot of output. Could be improved by updating the line instead of printing a new line :o)
+        if DEBUG:
+            print(maxValues[[0,1,4,5,6,7]]*100) # this will generate a lot of output. Could be improved by updating the line instead of printing a new line :o)
         for pos in radarObject.popframes:
             # update each part of the "radar"
             if pos == 0:
@@ -297,8 +375,9 @@ def updateRadar(radarObject):
             if prevmax[pos] < 0.01:
                 prevmax[pos]=0
             radarObject.updateBrush([0, prevmax[pos] * maxColorRange, 0], pos)
-        print(prevmax)
-        print('----')
+        if DEBUG:
+            print(prevmax)
+            print('----')
         QtWidgets.QApplication.processEvents() #update GUI in a loop process
 
 
@@ -309,6 +388,8 @@ def updateRadar(radarObject):
 n_chans=8 # number of channels on sound device
 n_channel = n_chans # yup, that's badly coded :o)
 maxSoundValue = 2. ** 32 /2 # to be updated according to the dtype stream recording
+
+STRENGTH_MODE = 2
 mapping = {}
 mapping['avg'] = 1 - 1  # avg = front left
 mapping['avd'] = 2 - 1  # avd = front right
@@ -325,6 +406,7 @@ prevmax = np.zeros(12) # initialize the "previous max" value
 redfactor = 5 #reduction factor if no upper value recorded
 refreshtime = 0.1 # time between two refresh
 
+DEBUG = False
 def find_device_auto(search_keywords, device_type='input'):
     """Automatically find device by searching through keyword list"""
     devices = sd.query_devices()
@@ -351,7 +433,7 @@ if __name__ == "__main__":
     mainwindow.resize(500, 500)
     mainwindow.show()
     
-    # 자동으로 디바이스 찾기 시도
+    # try to find the device automatically
     search_keywords = ['CABLE Output', 'VB-Audio Virtual Cable', 'VB-Audio']
     device_id, found_device = find_device_auto(search_keywords, 'input')
     
