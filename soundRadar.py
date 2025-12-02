@@ -204,6 +204,11 @@ def initfilter(x, t):
 def expfilter(x):
     return 1 - math.exp(-5*x)
 
+# Exponential fade effect
+def apply_fade(current_value, elapsed_time, decay_rate=2.0):
+    """Apply exponential decay fade - natural fade out"""
+    return current_value * math.exp(-decay_rate * elapsed_time)
+
 def updateRadar(radarObject):
     while True:
         # process input
@@ -222,11 +227,13 @@ def updateRadar(radarObject):
                     radarObject.popframes[pos]['fistFlag'] = True
                     prevmax[pos] = enhancer(prevmax[pos])
                 elif radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTFU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['fistFlag'] = False
                     radarObject.popframes[pos]['tupdate'] = time.time()
                 elif not radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTBU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['tupdate'] = time.time()
             if pos == 1:
                 if (maxValues[mapping['avd']] - maxValues[mapping['avg']]) / min(maxValues[mapping['avg']],maxValues[mapping['avd']]) > maxdifmain and (maxValues[mapping['avd']] - maxValues[mapping['avg']]) > prevmax[pos]:
@@ -236,11 +243,13 @@ def updateRadar(radarObject):
                     radarObject.popframes[pos]['fistFlag'] = True
                     prevmax[pos] = enhancer(prevmax[pos])
                 elif radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTFU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['fistFlag'] = False
                     radarObject.popframes[pos]['tupdate'] = time.time()
                 elif not radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTBU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['tupdate'] = time.time()
             if pos == 2:
                 if maxValues[mapping['d']] > maxValues[mapping['avd']] and maxValues[mapping['d']] - maxValues[mapping['avd']] > prevmax[pos]:
@@ -249,11 +258,13 @@ def updateRadar(radarObject):
                     radarObject.popframes[pos]['fistFlag'] = True
                     prevmax[pos] = enhancer(prevmax[pos])
                 elif radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTFU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['fistFlag'] = False
                     radarObject.popframes[pos]['tupdate'] = time.time()
                 elif not radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTBU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['tupdate'] = time.time()
             if pos == 3:
                 if maxValues[mapping['d']] > prevmax[pos]:
@@ -262,11 +273,13 @@ def updateRadar(radarObject):
                     radarObject.popframes[pos]['fistFlag'] = True
                     prevmax[pos] = enhancer(prevmax[pos])
                 elif radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTFU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['fistFlag'] = False
                     radarObject.popframes[pos]['tupdate'] = time.time()
                 elif not radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTBU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['tupdate'] = time.time()
             if pos == 4:
                 if maxValues[mapping['d']] > maxValues[mapping['ard']] and maxValues[mapping['d']] - maxValues[mapping['ard']] > prevmax[pos]:
@@ -275,11 +288,13 @@ def updateRadar(radarObject):
                     radarObject.popframes[pos]['fistFlag'] = True
                     prevmax[pos] = enhancer(prevmax[pos])
                 elif radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTFU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['fistFlag'] = False
                     radarObject.popframes[pos]['tupdate'] = time.time()
                 elif not radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTBU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['tupdate'] = time.time()
             if pos == 5:
                 if (maxValues[mapping['ard']] - maxValues[mapping['arg']]) / min(maxValues[mapping['arg']],maxValues[mapping['ard']]) > maxdifmain and (maxValues[mapping['ard']] - maxValues[mapping['arg']]) > prevmax[pos]:
@@ -288,11 +303,13 @@ def updateRadar(radarObject):
                     radarObject.popframes[pos]['fistFlag'] = True
                     prevmax[pos] = enhancer(prevmax[pos])
                 elif radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTFU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['fistFlag'] = False
                     radarObject.popframes[pos]['tupdate'] = time.time()
                 elif not radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTBU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['tupdate'] = time.time()
             if pos == 6:
                 if  ((maxValues[mapping['arg']] + maxValues[mapping['ard']]) / 2 ) > prevmax[pos]:
@@ -301,11 +318,13 @@ def updateRadar(radarObject):
                     radarObject.popframes[pos]['fistFlag'] = True
                     prevmax[pos] = enhancer(prevmax[pos])
                 elif radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTFU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['fistFlag'] = False
                     radarObject.popframes[pos]['tupdate'] = time.time()
                 elif not radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTBU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['tupdate'] = time.time()
             if pos == 7:
                 if (maxValues[mapping['arg']] - maxValues[mapping['ard']]) / min(maxValues[mapping['ard']],maxValues[mapping['arg']]) > maxdifmain and (maxValues[mapping['arg']] - maxValues[mapping['ard']]) > prevmax[pos]:
@@ -314,11 +333,13 @@ def updateRadar(radarObject):
                     radarObject.popframes[pos]['fistFlag'] = True
                     prevmax[pos] = enhancer(prevmax[pos])
                 elif radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTFU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['fistFlag'] = False
                     radarObject.popframes[pos]['tupdate'] = time.time()
                 elif not radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTBU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['tupdate'] = time.time()
             if pos == 8:
                 if maxValues[mapping['g']] > maxValues[mapping['arg']] and maxValues[mapping['g']] - maxValues[mapping['arg']] > prevmax[pos]:
@@ -327,11 +348,13 @@ def updateRadar(radarObject):
                     radarObject.popframes[pos]['fistFlag'] = True
                     prevmax[pos] = enhancer(prevmax[pos])
                 elif radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTFU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['fistFlag'] = False
                     radarObject.popframes[pos]['tupdate'] = time.time()
                 elif not radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTBU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['tupdate'] = time.time()
             if pos == 9:
                 if maxValues[mapping['g']] > prevmax[pos]:
@@ -340,11 +363,13 @@ def updateRadar(radarObject):
                     radarObject.popframes[pos]['fistFlag'] = True
                     prevmax[pos] = enhancer(prevmax[pos])
                 elif radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTFU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['fistFlag'] = False
                     radarObject.popframes[pos]['tupdate'] = time.time()
                 elif not radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTBU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['tupdate'] = time.time()
             if pos == 10:
                 if maxValues[mapping['g']] > maxValues[mapping['avg']] and maxValues[mapping['g']] - maxValues[mapping['avg']] > prevmax[pos]:
@@ -353,11 +378,13 @@ def updateRadar(radarObject):
                     radarObject.popframes[pos]['fistFlag'] = True
                     prevmax[pos] = enhancer(prevmax[pos])
                 elif radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTFU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['fistFlag'] = False
                     radarObject.popframes[pos]['tupdate'] = time.time()
                 elif not radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTBU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['tupdate'] = time.time()
             if pos == 11:
                 if (maxValues[mapping['avg']] - maxValues[mapping['avd']]) / min(maxValues[mapping['avg']],maxValues[mapping['avd']]) > maxdifmain and (maxValues[mapping['avg']] - maxValues[mapping['avd']]) > prevmax[pos]:
@@ -366,11 +393,13 @@ def updateRadar(radarObject):
                     radarObject.popframes[pos]['fistFlag'] = True
                     prevmax[pos] = enhancer(prevmax[pos])
                 elif radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTFU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['fistFlag'] = False
                     radarObject.popframes[pos]['tupdate'] = time.time()
                 elif not radarObject.popframes[pos]['fistFlag'] and time.time() - radarObject.popframes[pos]['tupdate'] > minTBU:
-                    prevmax[pos] = prevmax[pos] / redfactor
+                    elapsed_time = time.time() - radarObject.popframes[pos]['tupdate']
+                    prevmax[pos] = apply_fade(prevmax[pos], elapsed_time, fade_decay_rate)
                     radarObject.popframes[pos]['tupdate'] = time.time()
             if prevmax[pos] < 0.01:
                 prevmax[pos]=0
@@ -405,6 +434,9 @@ minThreshold = 0.005 # lowpass filter threshold on maxValues
 prevmax = np.zeros(12) # initialize the "previous max" value
 redfactor = 5 #reduction factor if no upper value recorded
 refreshtime = 0.1 # time between two refresh
+
+# Fade effect settings
+fade_decay_rate = 2.0  # Exponential decay rate (higher = faster fade out)
 
 DEBUG = False
 def find_device_auto(search_keywords, device_type='input'):
