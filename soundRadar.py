@@ -62,6 +62,10 @@ class TranslucentWidget(QtWidgets.QWidget):
             # very large sound: orange/red, opaque
             r, g, b, alpha = 255, 120, 40, 220
 
+        # Apply opacity multiplier
+        alpha = int(alpha * opacity_multiplier)
+        alpha = max(0, min(255, alpha))
+
         color = QtGui.QColor(r, g, b, alpha)
 
         # according to the strength, set the pen width/radius
@@ -73,7 +77,7 @@ class TranslucentWidget(QtWidgets.QWidget):
         # smaller sound is closer to the center, larger sound is much further from the center
         min_r = min(w, h) * 0.18  # closer to the center
         max_r = min(w, h) * 0.40  # a bit further from the center
-        radius = min_r + (max_r - min_r) * strength
+        radius = (min_r + (max_r - min_r) * strength) * size_multiplier
 
         rect = QtCore.QRectF(cx - radius, cy - radius, 2 * radius, 2 * radius)
 
@@ -437,6 +441,10 @@ refreshtime = 0.1 # time between two refresh
 
 # Fade effect settings
 fade_decay_rate = 2.0  # Exponential decay rate (higher = faster fade out)
+
+# Visualization settings
+size_multiplier = 2.0  # Radar size multiplier (0.5 ~ 2.0, default: 1.0)
+opacity_multiplier = 2.0  # Opacity multiplier (0.0 ~ 1.0, default: 1.0)
 
 DEBUG = False
 def find_device_auto(search_keywords, device_type='input'):
