@@ -1,6 +1,5 @@
 import sys
 from PyQt5 import QtWidgets, QtCore, QtGui
-import random
 import math
 import numpy as np
 import queue
@@ -52,11 +51,11 @@ class TranslucentWidget(QtWidgets.QWidget):
         if strength < 0.25:
             # very small sound: inside, light green, almost transparent
             r, g, b, alpha = 60, 200, 60, 40
-        elif strength < 0.5:
+        elif strength < 0.4:
             # small to medium: dark green
             r, g, b, alpha = 40, 255, 80, 90
         elif strength < 0.75:
-            # middle: yellow
+            # middle: yellow (wider range to make it more visible)
             r, g, b, alpha = 255, 220, 60, 150
         else:
             # very large sound: orange/red, opaque
@@ -75,28 +74,28 @@ class TranslucentWidget(QtWidgets.QWidget):
 
         # according to the screen size, set the radius
         # smaller sound is closer to the center, larger sound is much further from the center
-        min_r = min(w, h) * 0.18  # closer to the center
-        max_r = min(w, h) * 0.40  # a bit further from the center
-        # Apply size_multiplier to scale the entire range
-        radius = (min_r + (max_r - min_r) * strength) * size_multiplier
-        # Limit radius to ensure it's visible on screen
-        # The maximum radius should scale with size_multiplier
-        # Base max_radius for size_multiplier = 1.0
-        base_max_radius = min(w, h) * 0.48 - pen_width
-        # Scale max_radius with size_multiplier
-        max_radius = base_max_radius * size_multiplier
-        # The screen boundary limit should also scale with size_multiplier
-        # For size_multiplier = 1.0: use 48% of screen
-        # For size_multiplier = 3.0: use more of screen (e.g., 80%)
-        # For size_multiplier = 5.0: use almost all of screen (e.g., 95%)
-        # Interpolate between base (0.48) and max (0.95) based on size_multiplier
+        # First determine the maximum allowed radius ratio based on size_multiplier
         if size_multiplier <= 1.0:
-            screen_limit_ratio = 0.48
+            max_radius_ratio = 0.48
         else:
-            # Scale from 0.48 (at 1.0) to 0.95 (at 5.0)
-            screen_limit_ratio = 0.48 + (0.95 - 0.48) * min((size_multiplier - 1.0) / 4.0, 1.0)
-        max_screen_radius = (min(w, h) / 2) * screen_limit_ratio - pen_width
-        max_radius = min(max_radius, max_screen_radius)
+            # Scale from 0.48 (at 1.0) to 0.95 (at 5.0), and beyond 5.0 allow up to 0.98
+            if size_multiplier <= 5.0:
+                max_radius_ratio = 0.48 + (0.95 - 0.48) * ((size_multiplier - 1.0) / 4.0)
+            else:
+                # For size_multiplier > 5.0, scale from 0.95 to 0.98
+                max_radius_ratio = 0.95 + (0.98 - 0.95) * min((size_multiplier - 5.0) / 5.0, 1.0)
+        # Calculate maximum allowed radius
+        max_radius = (min(w, h) / 2) * max_radius_ratio - pen_width
+        # Calculate min/max radius with size_multiplier scaling
+        desired_min_radius = min(w, h) * 0.18 * size_multiplier
+        max_min_ratio = 0.6  # min_radius is at most 60% of max_radius
+        actual_min_radius = min(desired_min_radius, max_radius * max_min_ratio)
+        min_r = actual_min_radius / size_multiplier
+        max_r = max_radius / size_multiplier
+        if min_r >= max_r:
+            min_r = max_r * max_min_ratio
+        # Calculate radius based on strength
+        radius = (min_r + (max_r - min_r) * strength) * size_multiplier
         radius = min(radius, max_radius)
 
         rect = QtCore.QRectF(cx - radius, cy - radius, 2 * radius, 2 * radius)
@@ -216,10 +215,12 @@ def getMaxSound(n_chans):
 def enhancer(x):
     if x < minThreshold:
         return 0
-    elif x > minThreshold:
-        return 1
     else:
-        return (2*x-minThreshold)**(1/2)
+        # Apply a smooth curve instead of binary 0/1
+        # This preserves intermediate values for yellow color range
+        normalized = (x - minThreshold) / (1.0 - minThreshold)
+        # Apply a power curve to enhance larger values while keeping gradual transition
+        return normalized ** 0.7
 
 def initfilter(x, t):
     x[x<t] = 0
@@ -463,10 +464,10 @@ refreshtime = 0.1 # time between two refresh
 fade_decay_rate = 2.0  # Exponential decay rate (higher = faster fade out)
 
 # Visualization settings
-size_multiplier = 1.0  # Radar size multiplier (0.5 ~ 5.0, default: 1.0)
+size_multiplier = 15.0  # Radar size multiplier (0.5 ~ 15.0, default: 15.0)
 opacity_multiplier = 0.7  # Opacity multiplier (0.0 ~ 1.0, default: 1.0)
 
-DEBUG = False
+DEBUG = True
 def find_device_auto(search_keywords, device_type='input'):
     """Automatically find device by searching through keyword list"""
     devices = sd.query_devices()
@@ -490,7 +491,10 @@ if __name__ == "__main__":
     q = queue.Queue()
     app = QtWidgets.QApplication(sys.argv)
     mainwindow = ParentWidget()
-    mainwindow.resize(500, 500)
+    # Adjust window size based on size_multiplier for better visibility
+    base_size = 500
+    window_size = int(base_size * (1.0 + max(0, (size_multiplier - 5.0) * 0.1)))
+    mainwindow.resize(window_size, window_size)
     mainwindow.show()
     
     # try to find the device automatically
