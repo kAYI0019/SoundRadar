@@ -1,7 +1,9 @@
 import ctypes
 import ctypes.util
+from dataclasses import dataclass
 import math
 import queue
+import random
 import sys
 import time
 
@@ -37,6 +39,24 @@ fade_decay_rate = 2.0
 # Visualization settings
 size_multiplier = 15.0
 opacity_multiplier = 0.7
+ARC_OPACITY_MULTIPLIER = 0.28
+ARC_MIN_VISIBLE_STRENGTH = 0.02
+SHOW_ARCS = True
+SHOW_RIPPLES = True
+RIPPLE_STYLE = "watercolor"
+RIPPLE_THRESHOLD = 0.03
+RIPPLE_COOLDOWN = 0.18
+RIPPLE_DURATION = 0.65
+MAX_ACTIVE_PULSES = 72
+WATERCOLOR_BLOBS = 7
+WATERCOLOR_ANGLE_SPREAD = 26.0
+WATERCOLOR_INNER_SAFE_RATIO = 0.44
+WATERCOLOR_ALPHA_MULTIPLIER = 0.78
+WATERCOLOR_SOFT_SCALE = 1.85
+WATERCOLOR_PIGMENT_SCALE = 1.05
+WATERCOLOR_FLOW_TRAILS = 3
+WATERCOLOR_FLOW_DRIFT_DEG = 9.0
+WATERCOLOR_TRAIL_GAP_RATIO = 0.024
 DEBUG = False
 
 q = queue.Queue()
@@ -44,6 +64,176 @@ q = queue.Queue()
 
 def clamp(value, low=0.0, high=1.0):
     return max(low, min(high, value))
+
+
+@dataclass
+class SoundPulse:
+    sector: int
+    strength: float
+    created_at: float
+    duration: float = RIPPLE_DURATION
+    kind: str = "unknown"
+
+
+@dataclass(frozen=True)
+class WatercolorBlob:
+    angle_deg: float
+    distance: float
+    radius: float
+    opacity: float
+    stretch: float = 1.0
+    rotation_deg: float = 0.0
+    flow_deg: float = 0.0
+
+
+def pulse_age_ratio(pulse, now):
+    if pulse.duration <= 0:
+        return 1.0
+    return clamp((now - pulse.created_at) / pulse.duration)
+
+
+def pulse_opacity(pulse, now):
+    age = pulse_age_ratio(pulse, now)
+    if age >= 1.0:
+        return 0.0
+    return clamp(pulse.strength) * ((1.0 - age) ** 1.5)
+
+
+def pulse_expired(pulse, now):
+    return pulse_age_ratio(pulse, now) >= 1.0
+
+
+def classify_basic_sound_event(strength, previous_strength=0.0):
+    strength = clamp(float(strength))
+    previous_strength = clamp(float(previous_strength))
+    if strength >= 0.85:
+        return "impact"
+    if strength - previous_strength >= 0.25:
+        return "sharp"
+    return "unknown"
+
+
+def should_emit_pulse(last_time, now, cooldown=RIPPLE_COOLDOWN):
+    return now - last_time >= cooldown
+
+
+def create_pulses_from_levels(
+    levels,
+    now,
+    threshold=RIPPLE_THRESHOLD,
+    cooldown=RIPPLE_COOLDOWN,
+    last_pulse_times=None,
+    previous_levels=None,
+):
+    pulses = []
+    levels = np.asarray(levels)
+    if previous_levels is None:
+        previous_levels = np.zeros_like(levels)
+    for sector, strength in enumerate(levels):
+        strength = float(strength)
+        if strength < threshold:
+            continue
+        if last_pulse_times is not None and not should_emit_pulse(last_pulse_times[sector], now, cooldown):
+            continue
+        previous_strength = float(previous_levels[sector]) if sector < len(previous_levels) else 0.0
+        pulses.append(
+            SoundPulse(
+                sector=sector,
+                strength=clamp(strength),
+                created_at=now,
+                duration=RIPPLE_DURATION,
+                kind=classify_basic_sound_event(strength, previous_strength),
+            )
+        )
+        if last_pulse_times is not None:
+            last_pulse_times[sector] = now
+    return pulses
+
+
+def normalize_degrees(angle):
+    while angle <= -180:
+        angle += 360
+    while angle > 180:
+        angle -= 360
+    return angle
+
+
+def sector_mid_angle_deg(sector):
+    return normalize_degrees(arc_start_deg_for_position(sector) + 15)
+
+
+def pulse_ripple_radius(pulse, now, min_side):
+    age = pulse_age_ratio(pulse, now)
+    return min_side * (0.38 + 0.16 * age)
+
+
+def watercolor_pulse_seed(pulse):
+    strength_key = int(round(clamp(float(pulse.strength)) * 1000))
+    time_key = int(round(float(pulse.created_at) * 1000))
+    return ((int(pulse.sector) + 1) * 1_000_003 + time_key * 9_176 + strength_key * 37) & 0xFFFFFFFF
+
+
+def watercolor_blob_specs(pulse, now, min_side, blob_count=WATERCOLOR_BLOBS):
+    age = pulse_age_ratio(pulse, now)
+    strength = clamp(float(pulse.strength))
+    opacity = pulse_opacity(pulse, now)
+    base_distance = max(
+        pulse_ripple_radius(pulse, now, min_side),
+        min_side * WATERCOLOR_INNER_SAFE_RATIO,
+    )
+    center_angle = sector_mid_angle_deg(pulse.sector)
+    rng = random.Random(watercolor_pulse_seed(pulse))
+    specs = []
+    for index in range(blob_count):
+        angle_offset = rng.uniform(-WATERCOLOR_ANGLE_SPREAD, WATERCOLOR_ANGLE_SPREAD)
+        flow_deg = rng.uniform(-WATERCOLOR_FLOW_DRIFT_DEG, WATERCOLOR_FLOW_DRIFT_DEG)
+        distance = base_distance + min_side * (0.006 * index + rng.uniform(0.0, 0.026))
+        radius = min_side * rng.uniform(0.038, 0.078) * (0.82 + 0.58 * strength) * (0.9 + 0.28 * age)
+        blob_opacity = clamp(opacity * rng.uniform(0.52, 0.95))
+        specs.append(
+            WatercolorBlob(
+                angle_deg=normalize_degrees(center_angle + angle_offset + flow_deg * (age ** 1.2)),
+                distance=distance,
+                radius=radius,
+                opacity=blob_opacity,
+                stretch=rng.uniform(1.25, 2.15),
+                rotation_deg=normalize_degrees(center_angle + 90 + flow_deg * 0.65 + rng.uniform(-22, 22)),
+                flow_deg=flow_deg,
+            )
+        )
+    return specs
+
+
+def watercolor_color_level(strength):
+    return clamp(float(strength)) ** 2
+
+
+def watercolor_color(strength, opacity):
+    color_level = watercolor_color_level(strength)
+    if color_level < 0.25:
+        rgba = (72, 210, 116, 112)
+    elif color_level < 0.4:
+        rgba = (78, 226, 118, 128)
+    elif color_level < 0.75:
+        rgba = (238, 198, 68, 158)
+    else:
+        rgba = (238, 118, 48, 200)
+    red, green, blue, alpha = rgba
+    return QtGui.QColor(red, green, blue, int(clamp(alpha * opacity * WATERCOLOR_ALPHA_MULTIPLIER, 0, 255)))
+
+
+def pulse_color(strength, opacity):
+    strength = clamp(float(strength))
+    if strength < 0.25:
+        rgba = (60, 200, 60, 70)
+    elif strength < 0.4:
+        rgba = (40, 255, 80, 110)
+    elif strength < 0.75:
+        rgba = (255, 220, 60, 160)
+    else:
+        rgba = (255, 120, 40, 230)
+    red, green, blue, alpha = rgba
+    return QtGui.QColor(red, green, blue, int(clamp(alpha * opacity * opacity_multiplier, 0, 255)))
 
 
 def arc_start_deg_for_position(position):
@@ -285,7 +475,7 @@ class TranslucentWidget(QtWidgets.QWidget):
         else:
             rgba = (255, 120, 40, 220)
         r, g, b, alpha = rgba
-        return QtGui.QColor(r, g, b, int(clamp(alpha * opacity_multiplier, 0, 255)))
+        return QtGui.QColor(r, g, b, int(clamp(alpha * ARC_OPACITY_MULTIPLIER, 0, 255)))
 
     def _arc_radius(self, width, height, strength, pen_width):
         if size_multiplier <= 1.0:
@@ -307,9 +497,13 @@ class TranslucentWidget(QtWidgets.QWidget):
 
     def paintEvent(self, event):
         _ = event
+        if not SHOW_ARCS:
+            return
         width, height = self.width(), self.height()
         center_x, center_y = width / 2, height / 2
         strength = clamp(float(getattr(self, "strength", 0.0)))
+        if strength < ARC_MIN_VISIBLE_STRENGTH:
+            return
 
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
@@ -324,6 +518,145 @@ class TranslucentWidget(QtWidgets.QWidget):
         painter.end()
 
 
+class RippleOverlayWidget(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        self.setFocusPolicy(QtCore.Qt.NoFocus)
+
+    def _paint_arc_ripple(self, painter, pulse, now, min_side, center_x, center_y):
+        radius = pulse_ripple_radius(pulse, now, min_side)
+        rect = QtCore.QRectF(center_x - radius, center_y - radius, 2 * radius, 2 * radius)
+        span = 18 + 18 * clamp(pulse.strength)
+        start = sector_mid_angle_deg(pulse.sector) - span / 2
+        opacity = pulse_opacity(pulse, now)
+        line_width = 2 + 8 * clamp(pulse.strength) * (1.0 - pulse_age_ratio(pulse, now) * 0.55)
+        painter.setPen(QtGui.QPen(pulse_color(pulse.strength, opacity), line_width, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+        painter.setBrush(QtCore.Qt.NoBrush)
+        painter.drawArc(rect, int(start * 16), int(span * 16))
+
+        inner_radius = radius - min_side * 0.045
+        if inner_radius > min_side * 0.34:
+            inner_rect = QtCore.QRectF(center_x - inner_radius, center_y - inner_radius, 2 * inner_radius, 2 * inner_radius)
+            painter.setPen(QtGui.QPen(pulse_color(pulse.strength, opacity * 0.45), max(1.0, line_width * 0.55), QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+            painter.drawArc(inner_rect, int(start * 16), int(span * 16))
+
+    def _draw_watercolor_ellipse(self, painter, center, radius, stretch, rotation_deg, color, stops):
+        painter.save()
+        painter.translate(center)
+        painter.rotate(-rotation_deg)
+        painter.scale(stretch, 1.0)
+        gradient = QtGui.QRadialGradient(QtCore.QPointF(0, 0), radius)
+        for stop, alpha_scale in stops:
+            stop_color = QtGui.QColor(color)
+            stop_color.setAlpha(int(color.alpha() * alpha_scale))
+            gradient.setColorAt(stop, stop_color)
+        transparent = QtGui.QColor(color)
+        transparent.setAlpha(0)
+        gradient.setColorAt(1.0, transparent)
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(QtGui.QBrush(gradient))
+        painter.drawEllipse(QtCore.QRectF(-radius, -radius, radius * 2, radius * 2))
+        painter.restore()
+
+    def _watercolor_center(self, spec, center_x, center_y, distance=None, angle_deg=None):
+        angle_rad = math.radians(spec.angle_deg if angle_deg is None else angle_deg)
+        distance = spec.distance if distance is None else distance
+        return QtCore.QPointF(
+            center_x + math.cos(angle_rad) * distance,
+            center_y - math.sin(angle_rad) * distance,
+        )
+
+    def _paint_watercolor_pulse(self, painter, pulse, now, min_side, center_x, center_y):
+        specs = watercolor_blob_specs(pulse, now, min_side)
+        age = pulse_age_ratio(pulse, now)
+        safe_distance = min_side * WATERCOLOR_INNER_SAFE_RATIO
+        painter.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
+
+        for spec in specs:
+            if spec.opacity <= 0:
+                continue
+            for trail_index in range(WATERCOLOR_FLOW_TRAILS, 0, -1):
+                trail_ratio = trail_index / WATERCOLOR_FLOW_TRAILS
+                trail_distance = max(
+                    safe_distance,
+                    spec.distance - min_side * WATERCOLOR_TRAIL_GAP_RATIO * trail_ratio * (1.0 + 0.45 * age),
+                )
+                trail_angle = normalize_degrees(spec.angle_deg - spec.flow_deg * 0.22 * trail_ratio)
+                center = self._watercolor_center(spec, center_x, center_y, trail_distance, trail_angle)
+                color = watercolor_color(pulse.strength, spec.opacity * (0.82 - 0.16 * trail_ratio))
+                if color.alpha() <= 0:
+                    continue
+                self._draw_watercolor_ellipse(
+                    painter,
+                    center,
+                    spec.radius * (WATERCOLOR_SOFT_SCALE + 0.25 * trail_ratio),
+                    spec.stretch * (1.16 + 0.22 * trail_ratio),
+                    spec.rotation_deg - spec.flow_deg * 0.35 * trail_ratio,
+                    color,
+                    [(0.0, 0.16), (0.44, 0.105), (0.82, 0.035)],
+                )
+
+        for spec in specs:
+            if spec.opacity <= 0:
+                continue
+            center = self._watercolor_center(spec, center_x, center_y)
+            color = watercolor_color(pulse.strength, spec.opacity)
+            if color.alpha() <= 0:
+                continue
+            self._draw_watercolor_ellipse(
+                painter,
+                center,
+                spec.radius * WATERCOLOR_SOFT_SCALE,
+                spec.stretch * 1.12,
+                spec.rotation_deg,
+                color,
+                [(0.0, 0.2), (0.45, 0.13), (0.82, 0.04)],
+            )
+
+        for spec in specs:
+            if spec.opacity <= 0:
+                continue
+            center = self._watercolor_center(spec, center_x, center_y)
+            color = watercolor_color(pulse.strength, spec.opacity)
+            if color.alpha() <= 0:
+                continue
+            self._draw_watercolor_ellipse(
+                painter,
+                center,
+                spec.radius * WATERCOLOR_PIGMENT_SCALE,
+                spec.stretch,
+                spec.rotation_deg,
+                color,
+                [(0.0, 0.64), (0.36, 0.45), (0.72, 0.15)],
+            )
+
+    def paintEvent(self, event):
+        _ = event
+        if not SHOW_RIPPLES:
+            return
+        parent = self.parent()
+        if parent is None:
+            return
+
+        now = time.time()
+        width, height = self.width(), self.height()
+        min_side = min(width, height)
+        center_x, center_y = width / 2, height / 2
+
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        for pulse in list(getattr(parent, "pulses", [])):
+            if pulse_opacity(pulse, now) <= 0:
+                continue
+            if RIPPLE_STYLE == "watercolor":
+                self._paint_watercolor_pulse(painter, pulse, now, min_side, center_x, center_y)
+            else:
+                self._paint_arc_ripple(painter, pulse, now, min_side, center_x, center_y)
+        painter.end()
+
+
 class ParentWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -331,7 +664,15 @@ class ParentWidget(QtWidgets.QWidget):
         self.popframes = {}
         self._popflag = False
         self.global_peak = 0.1
+        self.pulses = []
+        self._last_pulse_times = np.zeros(RADAR_SECTORS)
+        self._previous_direction_levels = np.zeros(RADAR_SECTORS)
         self._create_sectors()
+        self.ripple_overlay = RippleOverlayWidget(self)
+        self.ripple_overlay.move(0, 0)
+        self.ripple_overlay.resize(self.width(), self.height())
+        self.ripple_overlay.show()
+        self.ripple_overlay.raise_()
         self.setBackgroundcolor()
         self._native_top_timer = QtCore.QTimer(self)
         self._native_top_timer.timeout.connect(self.ensure_on_top)
@@ -362,6 +703,10 @@ class ParentWidget(QtWidgets.QWidget):
                 shape = frame["shape"]
                 shape.move(0, 0)
                 shape.resize(self.width(), self.height())
+        if hasattr(self, "ripple_overlay"):
+            self.ripple_overlay.move(0, 0)
+            self.ripple_overlay.resize(self.width(), self.height())
+            self.ripple_overlay.raise_()
 
     def create_shape(self, position=0):
         shape = TranslucentWidget(self, position)
@@ -386,6 +731,16 @@ class ParentWidget(QtWidgets.QWidget):
         except Exception:
             self.popframes[position]["shape"].strength = 0.0
         self.update()
+
+    def add_pulses(self, pulses):
+        if not pulses:
+            return
+        self.pulses.extend(pulses)
+        if len(self.pulses) > MAX_ACTIVE_PULSES:
+            self.pulses = self.pulses[-MAX_ACTIVE_PULSES:]
+
+    def prune_pulses(self, now):
+        self.pulses = [pulse for pulse in self.pulses if not pulse_expired(pulse, now)]
 
     def setBackgroundcolor(self):
         palette = QtWidgets.QWidget.palette(self)
@@ -567,9 +922,25 @@ def updateRadar(radarObject):
             debug_channels = sorted(value for value in set(mapping.values()) if value is not None)
             print(max_values[debug_channels] * 100)
 
+        if SHOW_RIPPLES:
+            new_pulses = create_pulses_from_levels(
+                direction_levels,
+                now,
+                threshold=RIPPLE_THRESHOLD,
+                cooldown=RIPPLE_COOLDOWN,
+                last_pulse_times=radarObject._last_pulse_times,
+                previous_levels=radarObject._previous_direction_levels,
+            )
+            radarObject.add_pulses(new_pulses)
+            radarObject.prune_pulses(now)
+            radarObject._previous_direction_levels = np.array(direction_levels, copy=True)
+
         for position, frame in radarObject.popframes.items():
             update_sector_state(frame, position, direction_levels[position], now)
             radarObject.updateBrush([0, prevmax[position] * maxColorRange, 0], position)
+
+        if hasattr(radarObject, "ripple_overlay"):
+            radarObject.ripple_overlay.update()
 
         if DEBUG:
             print(prevmax)

@@ -101,6 +101,17 @@ The implementation is guarded so it only executes on `sys.platform == "win32"`.
 - A 16-channel output device does not guarantee 7.1 content. Browser tests and many apps output only stereo even when BlackHole 16ch is selected.
 - For real 7.1 validation, use a discrete multichannel source or a Python/sounddevice channel probe.
 
+## Visual pulse/ripple model
+
+- Direction detection produces 12 sector levels from `compute_direction_levels(...)`.
+- The visual layer converts meaningful sector levels into short-lived `SoundPulse` events.
+- `SoundPulse.kind` is intentionally basic for now (`unknown`, `sharp`, `impact`) so future agents can attach footstep/gunfire/vehicle classification later without changing the renderer API.
+- Ripples should stay in the outer screen region and expand outward. Preserve the center safe zone for aiming/gameplay focus.
+- Current default ripple style is `RIPPLE_STYLE="watercolor"`: render pulses as multiple soft `WatercolorBlob` radial-gradient ellipses rather than hard `drawArc()` ripple lines. Keep the blob math in `watercolor_blob_specs(...)` deterministic so tests can verify stable shapes that move outward and fade.
+- Keep `SHOW_ARCS=True` as a faint/debug baseline until the user explicitly approves ripple-only mode.
+- Use per-sector cooldown (`RIPPLE_COOLDOWN`) and threshold (`RIPPLE_THRESHOLD`) to avoid visual spam from sustained sound.
+- Do not tie animation directly to raw channel values; use pulse lifecycle helpers (`pulse_opacity`, `pulse_ripple_radius`, `pulse_expired`) so visuals remain stable and testable.
+
 ## Regression checks to preserve
 
 The test suite should keep covering:

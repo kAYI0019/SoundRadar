@@ -77,6 +77,110 @@ class SoundRadarMappingTests(unittest.TestCase):
         self.assertEqual(levels[7], 0.0)
 
 
+class SoundRadarPulseTests(unittest.TestCase):
+    def test_pulse_opacity_fades_to_zero(self):
+        pulse = soundRadar.SoundPulse(sector=3, strength=0.8, created_at=10.0, duration=1.0)
+
+        self.assertGreater(soundRadar.pulse_opacity(pulse, now=10.0), 0.7)
+        self.assertGreater(soundRadar.pulse_opacity(pulse, now=10.5), 0.0)
+        self.assertEqual(soundRadar.pulse_opacity(pulse, now=11.1), 0.0)
+
+    def test_create_pulses_from_levels_ignores_low_values(self):
+        levels = soundRadar.np.zeros(soundRadar.RADAR_SECTORS)
+        levels[3] = 0.004
+
+        pulses = soundRadar.create_pulses_from_levels(levels, now=10.0, threshold=0.02)
+
+        self.assertEqual(pulses, [])
+
+    def test_create_pulses_from_levels_uses_active_sector(self):
+        levels = soundRadar.np.zeros(soundRadar.RADAR_SECTORS)
+        levels[5] = 0.7
+
+        pulses = soundRadar.create_pulses_from_levels(levels, now=10.0, threshold=0.02)
+
+        self.assertEqual(len(pulses), 1)
+        self.assertEqual(pulses[0].sector, 5)
+        self.assertAlmostEqual(pulses[0].strength, 0.7)
+        self.assertEqual(pulses[0].kind, "sharp")
+
+    def test_create_pulses_respects_per_sector_cooldown(self):
+        levels = soundRadar.np.zeros(soundRadar.RADAR_SECTORS)
+        levels[5] = 0.7
+        last_pulse_times = soundRadar.np.zeros(soundRadar.RADAR_SECTORS)
+        last_pulse_times[5] = 10.0
+
+        blocked = soundRadar.create_pulses_from_levels(
+            levels,
+            now=10.05,
+            threshold=0.02,
+            cooldown=0.18,
+            last_pulse_times=last_pulse_times,
+        )
+        allowed = soundRadar.create_pulses_from_levels(
+            levels,
+            now=10.2,
+            threshold=0.02,
+            cooldown=0.18,
+            last_pulse_times=last_pulse_times,
+        )
+
+        self.assertEqual(blocked, [])
+        self.assertEqual(len(allowed), 1)
+
+    def test_sector_mid_angles_are_clock_like(self):
+        self.assertEqual(soundRadar.sector_mid_angle_deg(0), 90)
+        self.assertEqual(soundRadar.sector_mid_angle_deg(3), 0)
+        self.assertEqual(soundRadar.sector_mid_angle_deg(6), -90)
+        self.assertEqual(soundRadar.sector_mid_angle_deg(9), 180)
+
+    def test_ripple_radius_stays_outer_and_moves_outward(self):
+        pulse = soundRadar.SoundPulse(sector=3, strength=0.8, created_at=10.0, duration=1.0)
+
+        start_radius = soundRadar.pulse_ripple_radius(pulse, now=10.0, min_side=720)
+        later_radius = soundRadar.pulse_ripple_radius(pulse, now=10.5, min_side=720)
+
+        self.assertGreaterEqual(start_radius, 720 * 0.38)
+        self.assertGreater(later_radius, start_radius)
+
+    def test_basic_sound_kind_is_ready_for_future_classification(self):
+        self.assertEqual(soundRadar.classify_basic_sound_event(0.9, 0.1), "impact")
+        self.assertEqual(soundRadar.classify_basic_sound_event(0.5, 0.1), "sharp")
+        self.assertEqual(soundRadar.classify_basic_sound_event(0.2, 0.19), "unknown")
+
+    def test_default_ripple_style_is_watercolor(self):
+        self.assertEqual(soundRadar.RIPPLE_STYLE, "watercolor")
+
+    def test_watercolor_blobs_stay_near_outer_sector(self):
+        pulse = soundRadar.SoundPulse(sector=3, strength=0.8, created_at=10.0, duration=1.0)
+
+        specs = soundRadar.watercolor_blob_specs(pulse, now=10.0, min_side=720)
+
+        self.assertEqual(len(specs), soundRadar.WATERCOLOR_BLOBS)
+        for spec in specs:
+            self.assertGreaterEqual(spec.distance, 720 * soundRadar.WATERCOLOR_INNER_SAFE_RATIO)
+            angle_offset = abs(soundRadar.normalize_degrees(spec.angle_deg - soundRadar.sector_mid_angle_deg(3)))
+            self.assertLessEqual(angle_offset, soundRadar.WATERCOLOR_ANGLE_SPREAD)
+            self.assertGreater(spec.radius, 0.0)
+            self.assertGreaterEqual(spec.opacity, 0.0)
+            self.assertLessEqual(spec.opacity, 1.0)
+
+    def test_watercolor_blobs_are_stable_and_spread_outward(self):
+        pulse = soundRadar.SoundPulse(sector=5, strength=0.8, created_at=10.0, duration=1.0)
+
+        start_specs = soundRadar.watercolor_blob_specs(pulse, now=10.0, min_side=720)
+        repeated_start_specs = soundRadar.watercolor_blob_specs(pulse, now=10.0, min_side=720)
+        later_specs = soundRadar.watercolor_blob_specs(pulse, now=10.5, min_side=720)
+
+        self.assertEqual(start_specs, repeated_start_specs)
+        start_distance = sum(spec.distance for spec in start_specs) / len(start_specs)
+        later_distance = sum(spec.distance for spec in later_specs) / len(later_specs)
+        start_opacity = sum(spec.opacity for spec in start_specs) / len(start_specs)
+        later_opacity = sum(spec.opacity for spec in later_specs) / len(later_specs)
+        self.assertGreater(later_distance, start_distance)
+        self.assertLess(later_opacity, start_opacity)
+
+
 class SoundRadarWindowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -104,6 +208,11 @@ class SoundRadarWindowTests(unittest.TestCase):
         self.assertTrue(window._native_top_timer.isActive())
         window.ensure_on_top()
         self.assertFalse(window.raise_called)
+
+    def test_ripple_overlay_has_watercolor_renderer(self):
+        window = soundRadar.ParentWidget()
+
+        self.assertTrue(hasattr(window.ripple_overlay, "_paint_watercolor_pulse"))
 
     def test_overlay_flags_are_cross_platform_no_activate_topmost(self):
         for platform_name in ("darwin", "win32"):
