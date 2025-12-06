@@ -1,0 +1,13 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE/project-local settings
+.idea/
+
+# macOS metadata
+.DS_Store
