@@ -77,7 +77,27 @@ class TranslucentWidget(QtWidgets.QWidget):
         # smaller sound is closer to the center, larger sound is much further from the center
         min_r = min(w, h) * 0.18  # closer to the center
         max_r = min(w, h) * 0.40  # a bit further from the center
+        # Apply size_multiplier to scale the entire range
         radius = (min_r + (max_r - min_r) * strength) * size_multiplier
+        # Limit radius to ensure it's visible on screen
+        # The maximum radius should scale with size_multiplier
+        # Base max_radius for size_multiplier = 1.0
+        base_max_radius = min(w, h) * 0.48 - pen_width
+        # Scale max_radius with size_multiplier
+        max_radius = base_max_radius * size_multiplier
+        # The screen boundary limit should also scale with size_multiplier
+        # For size_multiplier = 1.0: use 48% of screen
+        # For size_multiplier = 3.0: use more of screen (e.g., 80%)
+        # For size_multiplier = 5.0: use almost all of screen (e.g., 95%)
+        # Interpolate between base (0.48) and max (0.95) based on size_multiplier
+        if size_multiplier <= 1.0:
+            screen_limit_ratio = 0.48
+        else:
+            # Scale from 0.48 (at 1.0) to 0.95 (at 5.0)
+            screen_limit_ratio = 0.48 + (0.95 - 0.48) * min((size_multiplier - 1.0) / 4.0, 1.0)
+        max_screen_radius = (min(w, h) / 2) * screen_limit_ratio - pen_width
+        max_radius = min(max_radius, max_screen_radius)
+        radius = min(radius, max_radius)
 
         rect = QtCore.QRectF(cx - radius, cy - radius, 2 * radius, 2 * radius)
 
@@ -443,8 +463,8 @@ refreshtime = 0.1 # time between two refresh
 fade_decay_rate = 2.0  # Exponential decay rate (higher = faster fade out)
 
 # Visualization settings
-size_multiplier = 2.0  # Radar size multiplier (0.5 ~ 2.0, default: 1.0)
-opacity_multiplier = 2.0  # Opacity multiplier (0.0 ~ 1.0, default: 1.0)
+size_multiplier = 1.0  # Radar size multiplier (0.5 ~ 5.0, default: 1.0)
+opacity_multiplier = 0.7  # Opacity multiplier (0.0 ~ 1.0, default: 1.0)
 
 DEBUG = False
 def find_device_auto(search_keywords, device_type='input'):
