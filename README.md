@@ -64,7 +64,7 @@ SoundRadar should still use **BlackHole 16ch** as its input device. The Multi-Ou
 Verify that BlackHole is exposed as a multichannel input:
 
 ```sh
-python -c "import sounddevice as sd; [print(i, d['name'], d['max_input_channels'], d['max_output_channels']) for i,d in enumerate(sd.query_devices())]"
+.venv/bin/python -c "import sounddevice as sd; [print(i, d['name'], d['max_input_channels'], d['max_output_channels']) for i,d in enumerate(sd.query_devices())]"
 ```
 
 Expected result:
@@ -76,8 +76,24 @@ BlackHole 16ch 16 16
 Run the application:
 
 ```sh
-python soundRadar.py
+.venv/bin/python -u soundRadar.py
 ```
+
+### Optional Hugging Face AST model
+
+SoundRadar can load the optional AST AudioSet teacher model for direction-event
+hints. On first use, Hugging Face may print an unauthenticated-request warning.
+Anonymous downloads work, but setting a token gives higher rate limits:
+
+```sh
+export HF_TOKEN=hf_your_token_here
+.venv/bin/python -u soundRadar.py
+```
+
+If you run the AST teacher manually and see a Transformers mel-filter warning
+about `num_mel_filters=128` and `num_frequency_bins=257`, it is from the
+pretrained AST feature extractor defaults, not from your BlackHole or speaker
+configuration.
 
 If the GUI opens but does not react and debug output stays at zero:
 
@@ -103,7 +119,7 @@ If the GUI opens but does not react and debug output stays at zero:
 12. Run the application:
 
 ```sh
-python soundRadar.py
+.venv\Scripts\python.exe soundRadar.py
 ```
 
 If the selected input device exposes fewer than 8 input channels, the app will still run but direction display is limited to a mono/stereo approximation.

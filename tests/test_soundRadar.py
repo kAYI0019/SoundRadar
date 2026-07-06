@@ -1,4 +1,6 @@
 import ctypes
+import queue
+from types import SimpleNamespace
 import sys
 import unittest
 
@@ -76,6 +78,106 @@ class SoundRadarMappingTests(unittest.TestCase):
         self.assertEqual(levels[6], 0.0)
         self.assertEqual(levels[7], 0.0)
 
+    def test_drain_audio_queue_returns_max_values_and_raw_blocks(self):
+        audio_queue = queue.Queue()
+        first = soundRadar.np.array([[0.1, -0.2], [0.3, 0.1]], dtype=soundRadar.np.float32)
+        second = soundRadar.np.array([[-0.4, 0.05]], dtype=soundRadar.np.float32)
+        audio_queue.put(first)
+        audio_queue.put(second)
+
+        max_values, blocks = soundRadar.drain_audio_queue(2, audio_queue=audio_queue)
+
+        soundRadar.np.testing.assert_allclose(max_values, [0.4, 0.2])
+        self.assertEqual(len(blocks), 2)
+        soundRadar.np.testing.assert_array_equal(blocks[0], first)
+        soundRadar.np.testing.assert_array_equal(blocks[1], second)
+
+    def test_timed_audio_queue_reports_latest_capture_time_for_latency(self):
+        audio_queue = queue.Queue()
+        first = soundRadar.np.array([[0.1, -0.2]], dtype=soundRadar.np.float32)
+        second = soundRadar.np.array([[0.4, -0.6]], dtype=soundRadar.np.float32)
+        audio_queue.put(soundRadar.TimedAudioBlock(first, captured_at=10.0))
+        audio_queue.put(soundRadar.TimedAudioBlock(second, captured_at=10.032))
+
+        max_values, blocks, latest_capture = soundRadar.drain_audio_queue_with_timing(2, audio_queue=audio_queue)
+
+        soundRadar.np.testing.assert_allclose(max_values, [0.4, 0.6])
+        self.assertEqual(len(blocks), 2)
+        self.assertAlmostEqual(latest_capture, 10.032)
+
+    def test_direction_event_runtime_scores_latest_audio_window(self):
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                class DoneFuture:
+                    def done(self):
+                        return True
+
+                    def result(self):
+                        return fn(*args)
+
+                return DoneFuture()
+
+        calls = []
+
+        def score_fn(audio, sample_rate, top_k, source_path):
+            calls.append((audio.copy(), sample_rate, top_k, source_path))
+            return SimpleNamespace(direction_event_scores={}, active_events_by_direction={})
+
+        runtime = soundRadar.DirectionEventRuntime(
+            sample_rate=10,
+            channel_count=2,
+            window_seconds=0.3,
+            interval_seconds=0.5,
+            top_k=4,
+            executor=ImmediateExecutor(),
+            score_fn=score_fn,
+        )
+        runtime.append_blocks([soundRadar.np.ones((4, 2), dtype=soundRadar.np.float32)])
+
+        prediction = runtime.maybe_submit(now=0.1)
+        blocked = runtime.maybe_submit(now=0.2)
+
+        self.assertIs(prediction, runtime.latest_prediction)
+        self.assertIsNone(blocked)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0].shape, (3, 2))
+        self.assertEqual(calls[0][1:], (10, 4, "<live>"))
+
+    def test_direction_event_runtime_tracks_ast_latency_from_capture_time(self):
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                class DoneFuture:
+                    def done(self):
+                        return True
+
+                    def result(self):
+                        return fn(*args)
+
+                return DoneFuture()
+
+        clock = [10.75]
+        runtime = soundRadar.DirectionEventRuntime(
+            sample_rate=10,
+            channel_count=2,
+            window_seconds=0.3,
+            interval_seconds=0.5,
+            executor=ImmediateExecutor(),
+            score_fn=lambda audio, sample_rate, top_k, source_path: SimpleNamespace(
+                direction_event_scores={}, active_events_by_direction={}
+            ),
+            latency_clock=lambda: clock[0],
+        )
+        runtime.append_blocks([soundRadar.np.ones((4, 2), dtype=soundRadar.np.float32)], capture_time=10.0)
+
+        runtime.maybe_submit(now=0.1)
+
+        self.assertAlmostEqual(runtime.latest_latency_ms, 750.0)
+
+    def test_direction_event_runtime_uses_auto_device_by_default(self):
+        # ast_teacher resolves "auto" to MPS on Apple Silicon, and CPU on Macs
+        # without a Metal-backed PyTorch device.
+        self.assertEqual(soundRadar.AST_DIRECTION_EVENT_DEVICE, "auto")
+
 
 class SoundRadarPulseTests(unittest.TestCase):
     def test_pulse_opacity_fades_to_zero(self):
@@ -147,6 +249,60 @@ class SoundRadarPulseTests(unittest.TestCase):
         self.assertEqual(soundRadar.classify_basic_sound_event(0.9, 0.1), "impact")
         self.assertEqual(soundRadar.classify_basic_sound_event(0.5, 0.1), "sharp")
         self.assertEqual(soundRadar.classify_basic_sound_event(0.2, 0.19), "unknown")
+
+    def test_direction_event_prediction_creates_event_kind_pulse(self):
+        prediction = SimpleNamespace(
+            direction_event_scores={
+                "right": {
+                    "background": 0.2,
+                    "footstep": 0.0,
+                    "gunshot": 0.8,
+                    "vehicle": 0.0,
+                    "explosion": 0.0,
+                }
+            },
+            active_events_by_direction={"right": ["gunshot"]},
+        )
+
+        pulses = soundRadar.create_pulses_from_direction_events(prediction, now=10.0, threshold=0.1)
+
+        self.assertEqual(len(pulses), 1)
+        self.assertEqual(pulses[0].sector, 3)
+        self.assertEqual(pulses[0].kind, "gunshot")
+        self.assertAlmostEqual(pulses[0].strength, 0.8)
+
+    def test_direction_event_debug_lines_show_compass_hud_and_device(self):
+        prediction = SimpleNamespace(
+            direction_event_scores={
+                "right": {"gunshot": 0.8, "footstep": 0.0, "vehicle": 0.0, "explosion": 0.0},
+                "left": {"gunshot": 0.0, "footstep": 0.45, "vehicle": 0.0, "explosion": 0.0},
+                "rear_right": {"gunshot": 0.0, "footstep": 0.0, "vehicle": 0.39, "explosion": 0.0},
+            },
+            active_events_by_direction={"right": ["gunshot"], "left": ["footstep"], "rear_right": ["vehicle"]},
+        )
+
+        lines = soundRadar.direction_event_debug_lines(
+            prediction,
+            threshold=0.1,
+            status="idle",
+            requested_device="auto",
+            resolved_device="mps",
+            radar_latency_ms=18.4,
+            ast_latency_ms=255.0,
+        )
+
+        self.assertEqual(lines[0], "AST idle auto→mps")
+        self.assertEqual(lines[1], "lag radar 18ms ast 255ms Δ+237ms")
+        self.assertIn("F: --", lines[2])
+        self.assertIn("L: FOOT .45", lines[4])
+        self.assertIn("R: GUN .80", lines[4])
+        self.assertIn("RR: VEH .39", lines[5])
+
+    def test_direction_event_runtime_device_label_shows_mps_resolution(self):
+        runtime = soundRadar.DirectionEventRuntime(sample_rate=16_000, channel_count=8, device="auto")
+        runtime.resolved_device = "mps"
+
+        self.assertEqual(soundRadar.direction_event_device_label(runtime), "auto→mps")
 
     def test_default_ripple_style_is_watercolor(self):
         self.assertEqual(soundRadar.RIPPLE_STYLE, "watercolor")

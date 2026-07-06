@@ -9,5 +9,12 @@ venv/
 # IDE/project-local settings
 .idea/
 
+# Agent/local planning artifacts
+.hermes/
+
+# Generated model smoke data and checkpoints
+sound_model/generated/
+sound_model/artifacts/
+
 # macOS metadata
 .DS_Store

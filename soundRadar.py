@@ -1,3 +1,4 @@
+import concurrent.futures
 import ctypes
 import ctypes.util
 from dataclasses import dataclass
@@ -59,6 +60,51 @@ WATERCOLOR_FLOW_DRIFT_DEG = 9.0
 WATERCOLOR_TRAIL_GAP_RATIO = 0.024
 DEBUG = False
 
+# Optional no-training AST teacher bridge. The model loads lazily in a background
+# worker so the overlay can keep painting while inference runs.
+ENABLE_AST_DIRECTION_EVENTS = True
+AST_DIRECTION_EVENT_DEVICE = "auto"
+AST_DIRECTION_EVENT_DTYPE = "auto"
+AST_DIRECTION_EVENT_TOP_K = 5
+AST_DIRECTION_EVENT_WINDOW_SECONDS = 1.0
+AST_DIRECTION_EVENT_INTERVAL = 1.25
+AST_DIRECTION_EVENT_THRESHOLD = 0.10
+AST_DIRECTION_EVENT_COOLDOWN = 0.55
+SHOW_EVENT_DEBUG_TEXT = True
+EVENT_DEBUG_MAX_LINES = 6
+
+DIRECTION_EVENT_SECTORS = {
+    "front_left": 11,
+    "front": 0,
+    "front_right": 1,
+    "left": 9,
+    "right": 3,
+    "rear_left": 7,
+    "rear_right": 5,
+}
+DIRECTION_EVENT_PRIORITY = ("explosion", "gunshot", "vehicle", "footstep")
+EVENT_KIND_RGBA = {
+    "footstep": (78, 226, 118, 150),
+    "gunshot": (255, 136, 42, 225),
+    "vehicle": (76, 166, 255, 185),
+    "explosion": (255, 76, 64, 235),
+}
+EVENT_DEBUG_LABELS = {
+    "explosion": "EXP",
+    "gunshot": "GUN",
+    "vehicle": "VEH",
+    "footstep": "FOOT",
+}
+DIRECTION_DEBUG_LABELS = {
+    "front_left": "FL",
+    "front": "F",
+    "front_right": "FR",
+    "left": "L",
+    "right": "R",
+    "rear_left": "RL",
+    "rear_right": "RR",
+}
+
 q = queue.Queue()
 
 
@@ -73,6 +119,12 @@ class SoundPulse:
     created_at: float
     duration: float = RIPPLE_DURATION
     kind: str = "unknown"
+
+
+@dataclass(frozen=True)
+class TimedAudioBlock:
+    samples: object
+    captured_at: float
 
 
 @dataclass(frozen=True)
@@ -150,6 +202,117 @@ def create_pulses_from_levels(
     return pulses
 
 
+def dominant_active_event(scores, active_events, threshold=AST_DIRECTION_EVENT_THRESHOLD):
+    active = set(active_events or [])
+    for event_name in DIRECTION_EVENT_PRIORITY:
+        score = clamp(float(scores.get(event_name, 0.0)))
+        if score >= threshold and (not active or event_name in active):
+            return event_name, score
+    return None, 0.0
+
+
+def create_pulses_from_direction_events(
+    prediction,
+    now,
+    threshold=AST_DIRECTION_EVENT_THRESHOLD,
+    cooldown=AST_DIRECTION_EVENT_COOLDOWN,
+    last_pulse_times=None,
+):
+    pulses = []
+    scores_by_direction = getattr(prediction, "direction_event_scores", {}) or {}
+    active_by_direction = getattr(prediction, "active_events_by_direction", {}) or {}
+
+    for direction, sector in DIRECTION_EVENT_SECTORS.items():
+        scores = scores_by_direction.get(direction, {})
+        event_name, score = dominant_active_event(scores, active_by_direction.get(direction, ()), threshold)
+        if event_name is None:
+            continue
+        if last_pulse_times is not None and not should_emit_pulse(last_pulse_times[sector], now, cooldown):
+            continue
+        pulses.append(SoundPulse(sector=sector, strength=score, created_at=now, duration=RIPPLE_DURATION, kind=event_name))
+        if last_pulse_times is not None:
+            last_pulse_times[sector] = now
+    return pulses
+
+
+def compact_score(score):
+    return f"{clamp(float(score)):.2f}".lstrip("0")
+
+
+def direction_event_device_label(runtime=None, requested_device=None, resolved_device=None, resolved_dtype=None):
+    if runtime is not None:
+        requested_device = getattr(runtime, "device", requested_device)
+        resolved_device = getattr(runtime, "resolved_device", resolved_device)
+        resolved_dtype = getattr(runtime, "resolved_dtype", resolved_dtype)
+    requested = str(requested_device or "?")
+    if resolved_device:
+        resolved = str(resolved_device)
+        label = resolved if requested == resolved else f"{requested}→{resolved}"
+    else:
+        label = f"{requested}→?" if requested == "auto" else requested
+    return f"{label}/{resolved_dtype}" if resolved_dtype else label
+
+
+def direction_event_debug_header(status=None, requested_device=None, resolved_device=None, resolved_dtype=None):
+    if status is None and requested_device is None and resolved_device is None and resolved_dtype is None:
+        return "AST events"
+    return f"AST {status or 'idle'} {direction_event_device_label(requested_device=requested_device, resolved_device=resolved_device, resolved_dtype=resolved_dtype)}"
+
+
+def format_latency_ms(value):
+    if value is None:
+        return "--"
+    return f"{max(0.0, float(value)):.0f}ms"
+
+
+def direction_latency_debug_line(radar_latency_ms=None, ast_latency_ms=None):
+    if radar_latency_ms is None or ast_latency_ms is None:
+        delta = "--"
+    else:
+        delta_value = float(ast_latency_ms) - float(radar_latency_ms)
+        sign = "+" if delta_value >= 0 else ""
+        delta = f"{sign}{delta_value:.0f}ms"
+    return f"lag radar {format_latency_ms(radar_latency_ms)} ast {format_latency_ms(ast_latency_ms)} Δ{delta}"
+
+
+def direction_event_debug_cell(direction, scores_by_direction, active_by_direction, threshold=AST_DIRECTION_EVENT_THRESHOLD):
+    label = DIRECTION_DEBUG_LABELS[direction]
+    scores = scores_by_direction.get(direction, {}) or {}
+    event_name, score = dominant_active_event(scores, active_by_direction.get(direction, ()), threshold)
+    if event_name is None:
+        return f"{label}: --"
+    return f"{label}: {EVENT_DEBUG_LABELS[event_name]} {compact_score(score)}"
+
+
+def direction_event_debug_lines(
+    prediction,
+    threshold=AST_DIRECTION_EVENT_THRESHOLD,
+    max_lines=EVENT_DEBUG_MAX_LINES,
+    status=None,
+    requested_device=None,
+    resolved_device=None,
+    resolved_dtype=None,
+    radar_latency_ms=None,
+    ast_latency_ms=None,
+):
+    _ = max_lines
+    header = direction_event_debug_header(status, requested_device, resolved_device, resolved_dtype)
+    if prediction is None:
+        return [header, direction_latency_debug_line(radar_latency_ms, ast_latency_ms), "waiting for audio/model..."]
+
+    scores_by_direction = getattr(prediction, "direction_event_scores", {}) or {}
+    active_by_direction = getattr(prediction, "active_events_by_direction", {}) or {}
+    cell = lambda direction: direction_event_debug_cell(direction, scores_by_direction, active_by_direction, threshold)
+    return [
+        header,
+        direction_latency_debug_line(radar_latency_ms, ast_latency_ms),
+        f"        {cell('front')}",
+        f"{cell('front_left')}    {cell('front_right')}",
+        f"{cell('left')}    {cell('right')}",
+        f"{cell('rear_left')}    {cell('rear_right')}",
+    ]
+
+
 def normalize_degrees(angle):
     while angle <= -180:
         angle += 360
@@ -208,7 +371,12 @@ def watercolor_color_level(strength):
     return clamp(float(strength)) ** 2
 
 
-def watercolor_color(strength, opacity):
+def color_rgba_for_kind(kind, fallback_rgba):
+    rgba = EVENT_KIND_RGBA.get(kind)
+    return rgba if rgba is not None else fallback_rgba
+
+
+def watercolor_color(strength, opacity, kind="unknown"):
     color_level = watercolor_color_level(strength)
     if color_level < 0.25:
         rgba = (72, 210, 116, 112)
@@ -218,11 +386,12 @@ def watercolor_color(strength, opacity):
         rgba = (238, 198, 68, 158)
     else:
         rgba = (238, 118, 48, 200)
+    rgba = color_rgba_for_kind(kind, rgba)
     red, green, blue, alpha = rgba
     return QtGui.QColor(red, green, blue, int(clamp(alpha * opacity * WATERCOLOR_ALPHA_MULTIPLIER, 0, 255)))
 
 
-def pulse_color(strength, opacity):
+def pulse_color(strength, opacity, kind="unknown"):
     strength = clamp(float(strength))
     if strength < 0.25:
         rgba = (60, 200, 60, 70)
@@ -232,6 +401,7 @@ def pulse_color(strength, opacity):
         rgba = (255, 220, 60, 160)
     else:
         rgba = (255, 120, 40, 230)
+    rgba = color_rgba_for_kind(kind, rgba)
     red, green, blue, alpha = rgba
     return QtGui.QColor(red, green, blue, int(clamp(alpha * opacity * opacity_multiplier, 0, 255)))
 
@@ -532,14 +702,14 @@ class RippleOverlayWidget(QtWidgets.QWidget):
         start = sector_mid_angle_deg(pulse.sector) - span / 2
         opacity = pulse_opacity(pulse, now)
         line_width = 2 + 8 * clamp(pulse.strength) * (1.0 - pulse_age_ratio(pulse, now) * 0.55)
-        painter.setPen(QtGui.QPen(pulse_color(pulse.strength, opacity), line_width, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+        painter.setPen(QtGui.QPen(pulse_color(pulse.strength, opacity, pulse.kind), line_width, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
         painter.setBrush(QtCore.Qt.NoBrush)
         painter.drawArc(rect, int(start * 16), int(span * 16))
 
         inner_radius = radius - min_side * 0.045
         if inner_radius > min_side * 0.34:
             inner_rect = QtCore.QRectF(center_x - inner_radius, center_y - inner_radius, 2 * inner_radius, 2 * inner_radius)
-            painter.setPen(QtGui.QPen(pulse_color(pulse.strength, opacity * 0.45), max(1.0, line_width * 0.55), QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+            painter.setPen(QtGui.QPen(pulse_color(pulse.strength, opacity * 0.45, pulse.kind), max(1.0, line_width * 0.55), QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
             painter.drawArc(inner_rect, int(start * 16), int(span * 16))
 
     def _draw_watercolor_ellipse(self, painter, center, radius, stretch, rotation_deg, color, stops):
@@ -585,7 +755,7 @@ class RippleOverlayWidget(QtWidgets.QWidget):
                 )
                 trail_angle = normalize_degrees(spec.angle_deg - spec.flow_deg * 0.22 * trail_ratio)
                 center = self._watercolor_center(spec, center_x, center_y, trail_distance, trail_angle)
-                color = watercolor_color(pulse.strength, spec.opacity * (0.82 - 0.16 * trail_ratio))
+                color = watercolor_color(pulse.strength, spec.opacity * (0.82 - 0.16 * trail_ratio), pulse.kind)
                 if color.alpha() <= 0:
                     continue
                 self._draw_watercolor_ellipse(
@@ -602,7 +772,7 @@ class RippleOverlayWidget(QtWidgets.QWidget):
             if spec.opacity <= 0:
                 continue
             center = self._watercolor_center(spec, center_x, center_y)
-            color = watercolor_color(pulse.strength, spec.opacity)
+            color = watercolor_color(pulse.strength, spec.opacity, pulse.kind)
             if color.alpha() <= 0:
                 continue
             self._draw_watercolor_ellipse(
@@ -619,7 +789,7 @@ class RippleOverlayWidget(QtWidgets.QWidget):
             if spec.opacity <= 0:
                 continue
             center = self._watercolor_center(spec, center_x, center_y)
-            color = watercolor_color(pulse.strength, spec.opacity)
+            color = watercolor_color(pulse.strength, spec.opacity, pulse.kind)
             if color.alpha() <= 0:
                 continue
             self._draw_watercolor_ellipse(
@@ -631,6 +801,66 @@ class RippleOverlayWidget(QtWidgets.QWidget):
                 color,
                 [(0.0, 0.64), (0.36, 0.45), (0.72, 0.15)],
             )
+
+    def _event_debug_lines(self, parent):
+        runtime = getattr(parent, "direction_event_runtime", None)
+        if runtime is None:
+            return direction_event_debug_lines(
+                getattr(parent, "latest_direction_event_prediction", None),
+                status="off",
+                requested_device="none",
+            )
+
+        requested_device = getattr(runtime, "device", AST_DIRECTION_EVENT_DEVICE)
+        resolved_device = getattr(runtime, "resolved_device", None)
+        resolved_dtype = getattr(runtime, "resolved_dtype", None)
+        if getattr(runtime, "disabled_reason", None):
+            return [
+                direction_event_debug_header("disabled", requested_device, resolved_device, resolved_dtype),
+                f"{runtime.disabled_reason[:64]}",
+            ]
+        status = "running" if getattr(runtime, "_future", None) is not None else "idle"
+        return direction_event_debug_lines(
+            getattr(parent, "latest_direction_event_prediction", None),
+            status=status,
+            requested_device=requested_device,
+            resolved_device=resolved_device,
+            resolved_dtype=resolved_dtype,
+            radar_latency_ms=getattr(parent, "radar_latency_ms", None),
+            ast_latency_ms=getattr(parent, "ast_latency_ms", None),
+        )
+
+    def _paint_event_debug_text(self, painter, parent, min_side):
+        if not SHOW_EVENT_DEBUG_TEXT:
+            return
+        lines = self._event_debug_lines(parent)
+        if not lines:
+            return
+
+        font = QtGui.QFont("Menlo")
+        font.setPointSize(max(10, int(min_side * 0.018)))
+        painter.save()
+        painter.setFont(font)
+        metrics = QtGui.QFontMetrics(font)
+        padding = 8
+        line_gap = 3
+        line_height = metrics.height()
+        text_width = max(metrics.horizontalAdvance(line) for line in lines)
+        box_width = text_width + padding * 2
+        box_height = line_height * len(lines) + line_gap * max(0, len(lines) - 1) + padding * 2
+        rect = QtCore.QRectF(14, 14, box_width, box_height)
+
+        painter.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
+        painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 0), 0))
+        painter.setBrush(QtGui.QColor(0, 0, 0, 150))
+        painter.drawRoundedRect(rect, 8, 8)
+
+        y = rect.top() + padding + metrics.ascent()
+        for index, line in enumerate(lines):
+            painter.setPen(QtGui.QColor(230, 255, 235, 235) if index == 0 else QtGui.QColor(220, 235, 255, 220))
+            painter.drawText(QtCore.QPointF(rect.left() + padding, y), line)
+            y += line_height + line_gap
+        painter.restore()
 
     def paintEvent(self, event):
         _ = event
@@ -654,6 +884,7 @@ class RippleOverlayWidget(QtWidgets.QWidget):
                 self._paint_watercolor_pulse(painter, pulse, now, min_side, center_x, center_y)
             else:
                 self._paint_arc_ripple(painter, pulse, now, min_side, center_x, center_y)
+        self._paint_event_debug_text(painter, parent, min_side)
         painter.end()
 
 
@@ -666,7 +897,12 @@ class ParentWidget(QtWidgets.QWidget):
         self.global_peak = 0.1
         self.pulses = []
         self._last_pulse_times = np.zeros(RADAR_SECTORS)
+        self._last_event_pulse_times = np.zeros(RADAR_SECTORS)
         self._previous_direction_levels = np.zeros(RADAR_SECTORS)
+        self.direction_event_runtime = None
+        self.latest_direction_event_prediction = None
+        self.radar_latency_ms = None
+        self.ast_latency_ms = None
         self._create_sectors()
         self.ripple_overlay = RippleOverlayWidget(self)
         self.ripple_overlay.move(0, 0)
@@ -752,19 +988,150 @@ def audio_callback(indata, frames, callback_time, status):
     _ = frames, callback_time
     if status:
         print(status, file=sys.stderr)
-    q.put(indata.copy())
+    q.put(TimedAudioBlock(indata.copy(), captured_at=time.perf_counter()))
+
+
+class DirectionEventRuntime:
+    def __init__(
+        self,
+        sample_rate,
+        channel_count,
+        *,
+        window_seconds=AST_DIRECTION_EVENT_WINDOW_SECONDS,
+        interval_seconds=AST_DIRECTION_EVENT_INTERVAL,
+        top_k=AST_DIRECTION_EVENT_TOP_K,
+        device=AST_DIRECTION_EVENT_DEVICE,
+        dtype=AST_DIRECTION_EVENT_DTYPE,
+        model_id=None,
+        executor=None,
+        score_fn=None,
+        latency_clock=None,
+    ):
+        self.sample_rate = int(sample_rate)
+        self.channel_count = int(channel_count)
+        self.max_samples = max(1, int(self.sample_rate * float(window_seconds)))
+        self.interval_seconds = float(interval_seconds)
+        self.top_k = int(top_k)
+        self.device = device
+        self.dtype = dtype
+        self.model_id = model_id
+        self._score_fn = score_fn or self._score_with_ast_teacher
+        self._executor = executor or concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="soundradar-ast")
+        self._latency_clock = latency_clock or time.perf_counter
+        self._future = None
+        self._future_capture_time = None
+        self._teacher = None
+        self._last_submit_time = -float("inf")
+        self._audio = np.zeros((0, self.channel_count), dtype=np.float32)
+        self.latest_audio_capture_time = None
+        self.latest_latency_ms = None
+        self.latest_prediction = None
+        self.disabled_reason = None
+        self.resolved_device = None
+        self.resolved_dtype = None
+
+    def append_blocks(self, blocks, capture_time=None):
+        prepared = []
+        for block in blocks:
+            audio = np.asarray(block, dtype=np.float32)
+            if audio.ndim == 1:
+                audio = audio[:, None]
+            if audio.ndim != 2 or audio.shape[0] == 0:
+                continue
+            if audio.shape[1] < self.channel_count:
+                padded = np.zeros((audio.shape[0], self.channel_count), dtype=np.float32)
+                padded[:, : audio.shape[1]] = audio
+                audio = padded
+            prepared.append(audio[:, : self.channel_count])
+        if prepared:
+            self._audio = np.concatenate([self._audio, *prepared], axis=0)[-self.max_samples :]
+            if capture_time is not None:
+                self.latest_audio_capture_time = float(capture_time)
+
+    def poll(self):
+        if self._future is None or not self._future.done():
+            return None
+        try:
+            self.latest_prediction = self._future.result()
+            if self._future_capture_time is not None:
+                self.latest_latency_ms = max(0.0, (self._latency_clock() - self._future_capture_time) * 1000.0)
+        except Exception as exc:
+            self.disabled_reason = str(exc)
+            print(f"AST direction events disabled: {exc}", file=sys.stderr)
+            self.latest_prediction = None
+        finally:
+            self._future = None
+            self._future_capture_time = None
+        return self.latest_prediction
+
+    def maybe_submit(self, now):
+        prediction = self.poll()
+        if self.disabled_reason is not None or self._future is not None:
+            return prediction
+        if self._audio.shape[0] < self.max_samples:
+            return prediction
+        if now - self._last_submit_time < self.interval_seconds:
+            return prediction
+        window = np.array(self._audio, copy=True)
+        self._last_submit_time = now
+        self._future_capture_time = self.latest_audio_capture_time
+        self._future = self._executor.submit(self._score_fn, window, self.sample_rate, self.top_k, "<live>")
+        return self.poll() if self._future.done() else prediction
+
+    def _score_with_ast_teacher(self, audio, sample_rate, top_k, source_path):
+        from sound_model.ast_teacher import AST_MODEL_ID, AstAudioSetTeacher
+        from sound_model.direction_events import score_direction_events
+
+        if self._teacher is None:
+            self._teacher = AstAudioSetTeacher(self.model_id or AST_MODEL_ID, device=self.device, dtype=self.dtype)
+        resolved_device = str(getattr(self._teacher, "device", self.device))
+        resolved_dtype = str(getattr(self._teacher, "dtype", self.dtype)).replace("torch.", "")
+        if self.resolved_device != resolved_device or self.resolved_dtype != resolved_dtype:
+            self.resolved_device = resolved_device
+            self.resolved_dtype = resolved_dtype
+            print(f"AST teacher device: {resolved_device} dtype: {resolved_dtype}")
+        return score_direction_events(audio, sample_rate, self._teacher, top_k=top_k, source_path=source_path)
+
+
+def unpack_audio_queue_item(item):
+    if isinstance(item, TimedAudioBlock):
+        return item.samples, float(item.captured_at)
+    return item, None
+
+
+def drain_audio_queue_with_timing(channel_count, audio_queue=None):
+    audio_queue = q if audio_queue is None else audio_queue
+    max_values = np.zeros(channel_count, dtype=np.float32)
+    blocks = []
+    latest_capture_time = None
+    while True:
+        try:
+            item = audio_queue.get_nowait()
+        except queue.Empty:
+            break
+        data, captured_at = unpack_audio_queue_item(item)
+        data = np.asarray(data, dtype=np.float32)
+        if data.ndim == 1:
+            data = data[:, None]
+        if data.size == 0:
+            continue
+        block = data[:, :channel_count]
+        blocks.append(block)
+        if captured_at is not None:
+            latest_capture_time = captured_at if latest_capture_time is None else max(latest_capture_time, captured_at)
+        block_max = np.nanmax(np.abs(block), axis=0)
+        max_values[: len(block_max)] = np.maximum(max_values[: len(block_max)], block_max)
+    return max_values / maxSoundValue, blocks, latest_capture_time
+
+
+def drain_audio_queue(channel_count, audio_queue=None):
+    max_values, blocks, _ = drain_audio_queue_with_timing(channel_count, audio_queue=audio_queue)
+    return max_values, blocks
 
 
 def getMaxSound(channel_count):
-    max_values = np.zeros(channel_count, dtype=np.float32)
-    while True:
-        try:
-            data = q.get_nowait()
-        except queue.Empty:
-            break
-        block_max = np.nanmax(np.abs(data), axis=0)
-        max_values = np.maximum(max_values, block_max[:channel_count])
-    return max_values / maxSoundValue
+    max_values, _ = drain_audio_queue(channel_count)
+    return max_values
 
 
 def enhancer(value):
@@ -911,12 +1278,28 @@ def update_sector_state(frame, position, candidate, now):
         prevmax[position] = 0.0
 
 
+def update_direction_event_runtime(radarObject, audio_blocks, now, capture_time=None):
+    runtime = getattr(radarObject, "direction_event_runtime", None)
+    if runtime is None:
+        return None
+    runtime.append_blocks(audio_blocks, capture_time=capture_time)
+    prediction = runtime.maybe_submit(now)
+    radarObject.ast_latency_ms = getattr(runtime, "latest_latency_ms", None)
+    if prediction is not None:
+        radarObject.latest_direction_event_prediction = prediction
+    return prediction
+
+
 def updateRadar(radarObject):
     while True:
         time.sleep(refreshtime)
-        max_values = initfilter(getMaxSound(n_channel), minThreshold)
+        raw_max_values, audio_blocks, latest_capture_time = drain_audio_queue_with_timing(n_channel)
+        max_values = initfilter(raw_max_values, minThreshold)
         direction_levels = compute_direction_levels(max_values, mapping)
         now = time.time()
+        if latest_capture_time is not None:
+            radarObject.radar_latency_ms = max(0.0, (time.perf_counter() - latest_capture_time) * 1000.0)
+        event_prediction = update_direction_event_runtime(radarObject, audio_blocks, now, latest_capture_time)
 
         if DEBUG:
             debug_channels = sorted(value for value in set(mapping.values()) if value is not None)
@@ -932,6 +1315,18 @@ def updateRadar(radarObject):
                 previous_levels=radarObject._previous_direction_levels,
             )
             radarObject.add_pulses(new_pulses)
+            event_pulses = (
+                create_pulses_from_direction_events(
+                    event_prediction,
+                    now,
+                    threshold=AST_DIRECTION_EVENT_THRESHOLD,
+                    cooldown=AST_DIRECTION_EVENT_COOLDOWN,
+                    last_pulse_times=radarObject._last_event_pulse_times,
+                )
+                if event_prediction is not None
+                else []
+            )
+            radarObject.add_pulses(event_pulses)
             radarObject.prune_pulses(now)
             radarObject._previous_direction_levels = np.array(direction_levels, copy=True)
 
@@ -1031,6 +1426,25 @@ def configure_audio_mapping(device_info):
         print("Warning: this device is not exposing 7.1 input. Direction display is limited.")
 
 
+def configure_direction_event_runtime(window, sample_rate, channel_count):
+    if not ENABLE_AST_DIRECTION_EVENTS:
+        return False
+    window.direction_event_runtime = DirectionEventRuntime(
+        sample_rate=sample_rate,
+        channel_count=channel_count,
+        window_seconds=AST_DIRECTION_EVENT_WINDOW_SECONDS,
+        interval_seconds=AST_DIRECTION_EVENT_INTERVAL,
+        top_k=AST_DIRECTION_EVENT_TOP_K,
+        device=AST_DIRECTION_EVENT_DEVICE,
+        dtype=AST_DIRECTION_EVENT_DTYPE,
+    )
+    print(
+        "AST direction-event overlay enabled "
+        f"({AST_DIRECTION_EVENT_WINDOW_SECONDS:.1f}s window, {AST_DIRECTION_EVENT_INTERVAL:.2f}s interval, {AST_DIRECTION_EVENT_DEVICE}, {AST_DIRECTION_EVENT_DTYPE})."
+    )
+    return True
+
+
 mapping, channel_mode = build_channel_mapping(n_chans)
 
 
@@ -1038,7 +1452,9 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     window = create_main_window()
     device_id, device_info = select_input_device()
+    assert device_info is not None
     configure_audio_mapping(device_info)
+    configure_direction_event_runtime(window, device_info.get("default_samplerate", 44_100), n_chans)
     print("Make sure system Sound Output is set to BlackHole/Loopback/VB-Cable or a Multi-Output device that includes it.")
 
     stream = sd.InputStream(
