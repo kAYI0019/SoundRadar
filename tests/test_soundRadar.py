@@ -3,6 +3,7 @@ import queue
 from types import SimpleNamespace
 import sys
 import unittest
+from unittest.mock import patch
 
 import soundRadar
 
@@ -178,6 +179,118 @@ class SoundRadarMappingTests(unittest.TestCase):
         # without a Metal-backed PyTorch device.
         self.assertEqual(soundRadar.AST_DIRECTION_EVENT_DEVICE, "auto")
 
+    def test_direction_event_runtime_warms_ast_teacher_in_background(self):
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                class DoneFuture:
+                    def done(self):
+                        return True
+
+                    def result(self):
+                        return fn(*args)
+
+                return DoneFuture()
+
+        class FakeTeacher:
+            instances = []
+
+            def __init__(self, model_id, *, device, dtype, **kwargs):
+                self.model_id = model_id
+                self.device = "mps:0"
+                self.dtype = "torch.float16"
+                self.warmups = []
+                FakeTeacher.instances.append(self)
+
+            def warmup_direction_batch(self, **kwargs):
+                self.warmups.append(kwargs)
+
+        with patch("sound_model.ast_teacher.AstAudioSetTeacher", FakeTeacher):
+            runtime = soundRadar.DirectionEventRuntime(
+                sample_rate=16_000,
+                channel_count=8,
+                executor=ImmediateExecutor(),
+                teacher_model="ast",
+            )
+
+        self.assertEqual(len(FakeTeacher.instances), 1)
+        self.assertEqual(FakeTeacher.instances[0].warmups[0]["direction_count"], 7)
+        self.assertEqual(FakeTeacher.instances[0].warmups[0]["sample_rate"], 16_000)
+        self.assertEqual(runtime.resolved_device, "mps:0")
+        self.assertEqual(runtime.resolved_dtype, "float16")
+
+    def test_direction_event_runtime_passes_compile_and_attention_options_to_teacher(self):
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                class DoneFuture:
+                    def done(self):
+                        return True
+
+                    def result(self):
+                        return fn(*args)
+
+                return DoneFuture()
+
+        class FakeTeacher:
+            init_kwargs = None
+
+            def __init__(self, model_id, **kwargs):
+                FakeTeacher.init_kwargs = kwargs
+                self.device = "cuda:0"
+                self.dtype = "torch.float16"
+
+            def warmup_direction_batch(self, **kwargs):
+                pass
+
+        with patch("sound_model.ast_teacher.AstAudioSetTeacher", FakeTeacher):
+            soundRadar.DirectionEventRuntime(
+                sample_rate=16_000,
+                channel_count=8,
+                executor=ImmediateExecutor(),
+                teacher_model="ast",
+                compile_model="reduce-overhead",
+                attn_implementation="sdpa",
+            )
+
+        self.assertEqual(FakeTeacher.init_kwargs["compile_model"], "reduce-overhead")
+        self.assertEqual(FakeTeacher.init_kwargs["attn_implementation"], "sdpa")
+
+    def test_direction_event_runtime_passes_selected_teacher_model_to_factory(self):
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                class DoneFuture:
+                    def done(self):
+                        return True
+
+                    def result(self):
+                        return fn(*args)
+
+                return DoneFuture()
+
+        factory_calls = []
+
+        class FakeTeacher:
+            device = "cpu"
+            dtype = "torch.float32"
+
+            def warmup_direction_batch(self, **kwargs):
+                pass
+
+        def fake_factory(teacher_model, **kwargs):
+            factory_calls.append((teacher_model, kwargs))
+            return FakeTeacher()
+
+        with patch("sound_model.ast_teacher.create_audio_event_teacher", fake_factory):
+            soundRadar.DirectionEventRuntime(
+                sample_rate=16_000,
+                channel_count=8,
+                executor=ImmediateExecutor(),
+                teacher_model="efficientat-mn10",
+                model_id="mn10_as",
+            )
+
+        self.assertEqual(factory_calls[0][0], "efficientat-mn10")
+        self.assertEqual(factory_calls[0][1]["model_id"], "mn10_as")
+
 
 class SoundRadarPulseTests(unittest.TestCase):
     def test_pulse_opacity_fades_to_zero(self):
@@ -250,6 +363,97 @@ class SoundRadarPulseTests(unittest.TestCase):
         self.assertEqual(soundRadar.classify_basic_sound_event(0.5, 0.1), "sharp")
         self.assertEqual(soundRadar.classify_basic_sound_event(0.2, 0.19), "unknown")
 
+    def test_dominant_active_event_uses_strongest_score_not_priority_order(self):
+        event_name, score = soundRadar.dominant_active_event(
+            {"explosion": 0.42, "gunshot": 0.99, "vehicle": 0.51, "footstep": 0.48},
+            active_events=["explosion", "gunshot", "vehicle", "footstep"],
+            threshold=0.1,
+        )
+
+        self.assertEqual(event_name, "gunshot")
+        self.assertAlmostEqual(score, 0.99)
+
+    def test_dominant_active_event_biases_ambiguous_game_guns_to_gunshot(self):
+        event_name, score = soundRadar.dominant_active_event(
+            {"explosion": 0.89, "gunshot": 0.72, "vehicle": 0.58, "footstep": 0.76},
+            active_events=["explosion", "gunshot", "vehicle", "footstep"],
+            threshold=0.1,
+        )
+
+        self.assertEqual(event_name, "gunshot")
+        self.assertAlmostEqual(score, 0.72)
+
+    def test_dominant_active_event_requires_high_confidence_for_step_icons(self):
+        weak_footstep, weak_score = soundRadar.dominant_active_event(
+            {"footstep": 0.74, "gunshot": 0.0},
+            active_events=["footstep"],
+            threshold=0.1,
+        )
+        strong_footstep, strong_score = soundRadar.dominant_active_event(
+            {"footstep": 0.93, "gunshot": 0.0},
+            active_events=["footstep"],
+            threshold=0.1,
+        )
+
+        self.assertIsNone(weak_footstep)
+        self.assertEqual(weak_score, 0.0)
+        self.assertEqual(strong_footstep, "footstep")
+        self.assertAlmostEqual(strong_score, 0.93)
+
+    def test_dominant_active_event_allows_sustained_vehicle_icon(self):
+        weak_vehicle, weak_score = soundRadar.dominant_active_event(
+            {"vehicle": 0.59, "gunshot": 0.0},
+            active_events=["vehicle"],
+            threshold=0.1,
+        )
+        vehicle, score = soundRadar.dominant_active_event(
+            {"vehicle": 0.70, "gunshot": 0.0},
+            active_events=["vehicle"],
+            threshold=0.1,
+        )
+
+        self.assertIsNone(weak_vehicle)
+        self.assertEqual(weak_score, 0.0)
+        self.assertEqual(vehicle, "vehicle")
+        self.assertAlmostEqual(score, 0.70)
+
+    def test_dominant_active_event_does_not_bias_close_vehicle_to_gunshot(self):
+        vehicle, score = soundRadar.dominant_active_event(
+            {"vehicle": 0.70, "gunshot": 0.55, "explosion": 0.0, "footstep": 0.0},
+            active_events=["vehicle", "gunshot"],
+            threshold=0.1,
+        )
+
+        self.assertEqual(vehicle, "vehicle")
+        self.assertAlmostEqual(score, 0.70)
+
+    def test_displayed_active_events_suppresses_gunshot_secondary_for_vehicle(self):
+        events = soundRadar.displayed_active_events(
+            {"vehicle": 0.70, "gunshot": 0.55, "explosion": 0.0, "footstep": 0.0},
+            active_events=["vehicle", "gunshot"],
+            threshold=0.1,
+        )
+
+        self.assertEqual(events, [("vehicle", 0.70)])
+
+    def test_displayed_active_events_can_show_vehicle_secondary_for_gunshot(self):
+        events = soundRadar.displayed_active_events(
+            {"vehicle": 0.70, "gunshot": 0.75, "explosion": 0.0, "footstep": 0.0},
+            active_events=["vehicle", "gunshot"],
+            threshold=0.1,
+        )
+
+        self.assertEqual(events, [("gunshot", 0.75), ("vehicle", 0.70)])
+
+    def test_displayed_active_events_does_not_show_tiny_secondary_gunshot(self):
+        events = soundRadar.displayed_active_events(
+            {"vehicle": 0.70, "gunshot": 0.10, "explosion": 0.0, "footstep": 0.0},
+            active_events=["vehicle", "gunshot"],
+            threshold=0.1,
+        )
+
+        self.assertEqual(events, [("vehicle", 0.70)])
+
     def test_direction_event_prediction_creates_event_kind_pulse(self):
         prediction = SimpleNamespace(
             direction_event_scores={
@@ -270,13 +474,113 @@ class SoundRadarPulseTests(unittest.TestCase):
         self.assertEqual(pulses[0].sector, 3)
         self.assertEqual(pulses[0].kind, "gunshot")
         self.assertAlmostEqual(pulses[0].strength, 0.8)
+        self.assertEqual(pulses[0].duration, soundRadar.EVENT_ICON_DURATION)
+
+    def test_direction_event_prediction_creates_multiple_event_icons_per_sector(self):
+        prediction = SimpleNamespace(
+            direction_event_scores={
+                "right": {
+                    "background": 0.1,
+                    "footstep": 0.0,
+                    "gunshot": 0.75,
+                    "vehicle": 0.70,
+                    "explosion": 0.0,
+                }
+            },
+            active_events_by_direction={"right": ["vehicle", "gunshot"]},
+        )
+
+        pulses = soundRadar.create_pulses_from_direction_events(prediction, now=10.0, threshold=0.1)
+
+        self.assertEqual(
+            [(pulse.kind, pulse.lane_index, pulse.lane_count) for pulse in pulses],
+            [("gunshot", 0, 2), ("vehicle", 1, 2)],
+        )
+
+    def test_direction_event_prediction_suppresses_secondary_gunshot_for_vehicle(self):
+        prediction = SimpleNamespace(
+            direction_event_scores={
+                "right": {
+                    "background": 0.1,
+                    "footstep": 0.0,
+                    "gunshot": 0.55,
+                    "vehicle": 0.70,
+                    "explosion": 0.0,
+                }
+            },
+            active_events_by_direction={"right": ["vehicle", "gunshot"]},
+        )
+
+        pulses = soundRadar.create_pulses_from_direction_events(prediction, now=10.0, threshold=0.1)
+
+        self.assertEqual([(pulse.kind, pulse.lane_index, pulse.lane_count) for pulse in pulses], [("vehicle", 0, 1)])
+
+    def test_event_icon_center_uses_sector_mid_angle_and_outer_ring(self):
+        center = soundRadar.event_icon_center(sector=3, min_side=720, center_x=360, center_y=360)
+
+        self.assertAlmostEqual(center.x(), 360 + 720 * soundRadar.EVENT_ICON_DISTANCE_RATIO)
+        self.assertAlmostEqual(center.y(), 360)
+
+        front_center = soundRadar.event_icon_center(sector=0, min_side=720, center_x=360, center_y=360)
+
+        self.assertAlmostEqual(front_center.x(), 360)
+        self.assertAlmostEqual(front_center.y(), 360 - 720 * soundRadar.EVENT_ICON_DISTANCE_RATIO)
+
+    def test_event_icon_center_offsets_multiple_lanes_tangentially(self):
+        first = soundRadar.event_icon_center(
+            sector=0,
+            min_side=720,
+            center_x=360,
+            center_y=360,
+            lane_index=0,
+            lane_count=2,
+        )
+        second = soundRadar.event_icon_center(
+            sector=0,
+            min_side=720,
+            center_x=360,
+            center_y=360,
+            lane_index=1,
+            lane_count=2,
+        )
+
+        self.assertLess(min(first.x(), second.x()), 360)
+        self.assertGreater(max(first.x(), second.x()), 360)
+        self.assertAlmostEqual(first.y(), second.y())
+
+    def test_event_icon_size_ratios_are_compact_for_dual_icons(self):
+        self.assertLessEqual(soundRadar.EVENT_ICON_MAX_SIZE_RATIO, 0.066)
+        self.assertLessEqual(soundRadar.EVENT_ICON_MIN_SIZE_RATIO, 0.040)
+
+    def test_event_icon_size_uses_strength_without_moving_direction(self):
+        weak = soundRadar.SoundPulse(sector=1, strength=0.2, created_at=10.0, kind="gunshot")
+        strong = soundRadar.SoundPulse(sector=1, strength=0.9, created_at=10.0, kind="gunshot")
+
+        self.assertGreater(soundRadar.event_icon_size(strong, now=10.1, min_side=720), soundRadar.event_icon_size(weak, now=10.1, min_side=720))
+        self.assertEqual(
+            soundRadar.event_icon_center(weak.sector, 720, 360, 360),
+            soundRadar.event_icon_center(strong.sector, 720, 360, 360),
+        )
+
+    def test_event_icon_opacity_holds_before_fading(self):
+        pulse = soundRadar.SoundPulse(sector=1, strength=0.8, created_at=10.0, duration=soundRadar.EVENT_ICON_DURATION, kind="gunshot")
+
+        self.assertGreater(soundRadar.event_icon_opacity(pulse, now=12.0), 0.85)
+        self.assertGreater(soundRadar.event_icon_opacity(pulse, now=13.0), 0.0)
+        self.assertEqual(soundRadar.event_icon_opacity(pulse, now=14.0), 0.0)
+
+    def test_event_kind_does_not_recolor_watercolor_ripple(self):
+        gunshot = soundRadar.watercolor_color(0.8, 1.0, "gunshot")
+        vehicle = soundRadar.watercolor_color(0.8, 1.0, "vehicle")
+
+        self.assertEqual(gunshot.getRgb(), vehicle.getRgb())
 
     def test_direction_event_debug_lines_show_compass_hud_and_device(self):
         prediction = SimpleNamespace(
             direction_event_scores={
                 "right": {"gunshot": 0.8, "footstep": 0.0, "vehicle": 0.0, "explosion": 0.0},
-                "left": {"gunshot": 0.0, "footstep": 0.45, "vehicle": 0.0, "explosion": 0.0},
-                "rear_right": {"gunshot": 0.0, "footstep": 0.0, "vehicle": 0.39, "explosion": 0.0},
+                "left": {"gunshot": 0.0, "footstep": 0.92, "vehicle": 0.0, "explosion": 0.0},
+                "rear_right": {"gunshot": 0.0, "footstep": 0.0, "vehicle": 0.88, "explosion": 0.0},
             },
             active_events_by_direction={"right": ["gunshot"], "left": ["footstep"], "rear_right": ["vehicle"]},
         )
@@ -285,21 +589,22 @@ class SoundRadarPulseTests(unittest.TestCase):
             prediction,
             threshold=0.1,
             status="idle",
+            teacher_model="efficientat-mn10",
             requested_device="auto",
             resolved_device="mps",
             radar_latency_ms=18.4,
             ast_latency_ms=255.0,
         )
 
-        self.assertEqual(lines[0], "AST idle auto→mps")
-        self.assertEqual(lines[1], "lag radar 18ms ast 255ms Δ+237ms")
+        self.assertEqual(lines[0], "efficientat-mn10 idle auto→mps")
+        self.assertEqual(lines[1], "lag radar 18ms model 255ms Δ+237ms")
         self.assertIn("F: --", lines[2])
-        self.assertIn("L: FOOT .45", lines[4])
+        self.assertIn("L: FOOT .92", lines[4])
         self.assertIn("R: GUN .80", lines[4])
-        self.assertIn("RR: VEH .39", lines[5])
+        self.assertIn("RR: VEH .88", lines[5])
 
     def test_direction_event_runtime_device_label_shows_mps_resolution(self):
-        runtime = soundRadar.DirectionEventRuntime(sample_rate=16_000, channel_count=8, device="auto")
+        runtime = soundRadar.DirectionEventRuntime(sample_rate=16_000, channel_count=8, device="auto", warmup=False)
         runtime.resolved_device = "mps"
 
         self.assertEqual(soundRadar.direction_event_device_label(runtime), "auto→mps")

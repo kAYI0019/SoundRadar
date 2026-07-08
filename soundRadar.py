@@ -60,18 +60,38 @@ WATERCOLOR_FLOW_DRIFT_DEG = 9.0
 WATERCOLOR_TRAIL_GAP_RATIO = 0.024
 DEBUG = False
 
-# Optional no-training AST teacher bridge. The model loads lazily in a background
-# worker so the overlay can keep painting while inference runs.
+# Optional no-training AudioSet teacher bridge. The model loads lazily in a
+# background worker so the overlay can keep painting while inference runs.
 ENABLE_AST_DIRECTION_EVENTS = True
 AST_DIRECTION_EVENT_DEVICE = "auto"
 AST_DIRECTION_EVENT_DTYPE = "auto"
+AST_DIRECTION_EVENT_ATTN_IMPLEMENTATION = None
+AST_DIRECTION_EVENT_COMPILE = False
+AST_DIRECTION_EVENT_TEACHER_MODEL = "efficientat-mn20"
+# efficientat-mn10 efficientat-mn20 ast
+AST_DIRECTION_EVENT_MODEL_ID = None
 AST_DIRECTION_EVENT_TOP_K = 5
 AST_DIRECTION_EVENT_WINDOW_SECONDS = 1.0
 AST_DIRECTION_EVENT_INTERVAL = 1.25
 AST_DIRECTION_EVENT_THRESHOLD = 0.10
 AST_DIRECTION_EVENT_COOLDOWN = 0.55
+AST_DIRECTION_EVENT_WARMUP = True
 SHOW_EVENT_DEBUG_TEXT = True
 EVENT_DEBUG_MAX_LINES = 6
+DIRECTION_EVENT_DISPLAY_THRESHOLDS = {
+    "gunshot": 0.10,
+    "explosion": 0.85,
+    "vehicle": 0.60,
+    "footstep": 0.85,
+}
+DIRECTION_EVENT_SECONDARY_DISPLAY_THRESHOLDS = {
+    "gunshot": 0.35,
+    "explosion": 0.85,
+    "vehicle": 0.60,
+    "footstep": 0.85,
+}
+DIRECTION_EVENT_GUNSHOT_BIAS_MARGIN = 0.25
+DIRECTION_EVENT_MAX_ICONS_PER_DIRECTION = 2
 
 DIRECTION_EVENT_SECTORS = {
     "front_left": 11,
@@ -83,11 +103,29 @@ DIRECTION_EVENT_SECTORS = {
     "rear_right": 5,
 }
 DIRECTION_EVENT_PRIORITY = ("explosion", "gunshot", "vehicle", "footstep")
+CLASSIFIED_EVENT_KINDS = frozenset(DIRECTION_EVENT_PRIORITY)
+EVENT_ICON_DURATION = 3.5
+EVENT_ICON_HOLD_AGE_RATIO = 0.68
+EVENT_ICON_DISTANCE_RATIO = 0.40
+EVENT_ICON_STACK_SPACING_RATIO = 0.070
+EVENT_ICON_MIN_SIZE_RATIO = 0.040
+EVENT_ICON_MAX_SIZE_RATIO = 0.066
+EVENT_ICON_POP_AGE_RATIO = 0.28
+EVENT_ICON_POP_SCALE = 0.16
+EVENT_ICON_RGBA = (246, 242, 218, 235)
+EVENT_ICON_SHADOW_RGBA = (0, 0, 0, 170)
+EVENT_ICON_BADGE_RGBA = (4, 8, 10, 148)
 EVENT_KIND_RGBA = {
     "footstep": (78, 226, 118, 150),
     "gunshot": (255, 136, 42, 225),
     "vehicle": (76, 166, 255, 185),
     "explosion": (255, 76, 64, 235),
+}
+EVENT_ICON_LABELS = {
+    "explosion": "BOOM",
+    "gunshot": "GUN",
+    "vehicle": "CAR",
+    "footstep": "STEP",
 }
 EVENT_DEBUG_LABELS = {
     "explosion": "EXP",
@@ -119,6 +157,8 @@ class SoundPulse:
     created_at: float
     duration: float = RIPPLE_DURATION
     kind: str = "unknown"
+    lane_index: int = 0
+    lane_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -202,13 +242,80 @@ def create_pulses_from_levels(
     return pulses
 
 
-def dominant_active_event(scores, active_events, threshold=AST_DIRECTION_EVENT_THRESHOLD):
+def dominant_active_event(
+    scores,
+    active_events,
+    threshold=AST_DIRECTION_EVENT_THRESHOLD,
+    event_thresholds=DIRECTION_EVENT_DISPLAY_THRESHOLDS,
+):
     active = set(active_events or [])
+    best_event = None
+    best_score = 0.0
+    gunshot_score = clamp(float(scores.get("gunshot", 0.0)))
+    gunshot_threshold = max(float(threshold), float(event_thresholds.get("gunshot", threshold)))
     for event_name in DIRECTION_EVENT_PRIORITY:
         score = clamp(float(scores.get(event_name, 0.0)))
-        if score >= threshold and (not active or event_name in active):
-            return event_name, score
-    return None, 0.0
+        event_threshold = max(float(threshold), float(event_thresholds.get(event_name, threshold)))
+        if score >= event_threshold and (not active or event_name in active):
+            if best_event is None or score > best_score:
+                best_event = event_name
+                best_score = score
+    if (
+        best_event in ("explosion", "footstep")
+        and gunshot_score >= gunshot_threshold
+        and (not active or "gunshot" in active)
+        and best_score - gunshot_score <= DIRECTION_EVENT_GUNSHOT_BIAS_MARGIN
+    ):
+        return "gunshot", gunshot_score
+    return best_event, best_score
+
+
+def event_display_threshold(event_name, threshold, event_thresholds):
+    return max(float(threshold), float(event_thresholds.get(event_name, threshold)))
+
+
+def active_event_candidates(
+    scores,
+    active_events,
+    threshold=AST_DIRECTION_EVENT_THRESHOLD,
+    event_thresholds=DIRECTION_EVENT_DISPLAY_THRESHOLDS,
+):
+    active = set(active_events or [])
+    candidates = []
+    for event_name in DIRECTION_EVENT_PRIORITY:
+        score = clamp(float(scores.get(event_name, 0.0)))
+        if score >= event_display_threshold(event_name, threshold, event_thresholds) and (not active or event_name in active):
+            candidates.append((event_name, score))
+    return candidates
+
+
+def displayed_active_events(
+    scores,
+    active_events,
+    threshold=AST_DIRECTION_EVENT_THRESHOLD,
+    event_thresholds=DIRECTION_EVENT_DISPLAY_THRESHOLDS,
+    secondary_thresholds=DIRECTION_EVENT_SECONDARY_DISPLAY_THRESHOLDS,
+    max_events=DIRECTION_EVENT_MAX_ICONS_PER_DIRECTION,
+):
+    candidates = active_event_candidates(scores, active_events, threshold, event_thresholds)
+    if not candidates:
+        return []
+
+    primary_event, primary_score = dominant_active_event(scores, active_events, threshold, event_thresholds)
+    ordered = []
+    if primary_event is not None:
+        ordered.append((primary_event, primary_score))
+
+    for event_name, score in sorted(candidates, key=lambda item: item[1], reverse=True):
+        if event_name == primary_event:
+            continue
+        if primary_event == "vehicle" and event_name == "gunshot":
+            continue
+        if score >= event_display_threshold(event_name, threshold, secondary_thresholds):
+            ordered.append((event_name, score))
+        if len(ordered) >= int(max_events):
+            break
+    return ordered[: int(max_events)]
 
 
 def create_pulses_from_direction_events(
@@ -224,12 +331,24 @@ def create_pulses_from_direction_events(
 
     for direction, sector in DIRECTION_EVENT_SECTORS.items():
         scores = scores_by_direction.get(direction, {})
-        event_name, score = dominant_active_event(scores, active_by_direction.get(direction, ()), threshold)
-        if event_name is None:
+        events = displayed_active_events(scores, active_by_direction.get(direction, ()), threshold)
+        if not events:
             continue
         if last_pulse_times is not None and not should_emit_pulse(last_pulse_times[sector], now, cooldown):
             continue
-        pulses.append(SoundPulse(sector=sector, strength=score, created_at=now, duration=RIPPLE_DURATION, kind=event_name))
+        lane_count = len(events)
+        for lane_index, (event_name, score) in enumerate(events):
+            pulses.append(
+                SoundPulse(
+                    sector=sector,
+                    strength=score,
+                    created_at=now,
+                    duration=EVENT_ICON_DURATION,
+                    kind=event_name,
+                    lane_index=lane_index,
+                    lane_count=lane_count,
+                )
+            )
         if last_pulse_times is not None:
             last_pulse_times[sector] = now
     return pulses
@@ -253,10 +372,17 @@ def direction_event_device_label(runtime=None, requested_device=None, resolved_d
     return f"{label}/{resolved_dtype}" if resolved_dtype else label
 
 
-def direction_event_debug_header(status=None, requested_device=None, resolved_device=None, resolved_dtype=None):
+def direction_event_debug_header(
+    status=None,
+    requested_device=None,
+    resolved_device=None,
+    resolved_dtype=None,
+    teacher_model=None,
+):
+    teacher_label = str(teacher_model or AST_DIRECTION_EVENT_TEACHER_MODEL or "teacher")
     if status is None and requested_device is None and resolved_device is None and resolved_dtype is None:
-        return "AST events"
-    return f"AST {status or 'idle'} {direction_event_device_label(requested_device=requested_device, resolved_device=resolved_device, resolved_dtype=resolved_dtype)}"
+        return f"{teacher_label} events"
+    return f"{teacher_label} {status or 'idle'} {direction_event_device_label(requested_device=requested_device, resolved_device=resolved_device, resolved_dtype=resolved_dtype)}"
 
 
 def format_latency_ms(value):
@@ -272,16 +398,18 @@ def direction_latency_debug_line(radar_latency_ms=None, ast_latency_ms=None):
         delta_value = float(ast_latency_ms) - float(radar_latency_ms)
         sign = "+" if delta_value >= 0 else ""
         delta = f"{sign}{delta_value:.0f}ms"
-    return f"lag radar {format_latency_ms(radar_latency_ms)} ast {format_latency_ms(ast_latency_ms)} Δ{delta}"
+    return f"lag radar {format_latency_ms(radar_latency_ms)} model {format_latency_ms(ast_latency_ms)} Δ{delta}"
 
 
 def direction_event_debug_cell(direction, scores_by_direction, active_by_direction, threshold=AST_DIRECTION_EVENT_THRESHOLD):
     label = DIRECTION_DEBUG_LABELS[direction]
     scores = scores_by_direction.get(direction, {}) or {}
-    event_name, score = dominant_active_event(scores, active_by_direction.get(direction, ()), threshold)
-    if event_name is None:
+    events = displayed_active_events(scores, active_by_direction.get(direction, ()), threshold)
+    if not events:
         return f"{label}: --"
-    return f"{label}: {EVENT_DEBUG_LABELS[event_name]} {compact_score(score)}"
+    event_labels = "/".join(EVENT_DEBUG_LABELS[event_name] for event_name, _ in events)
+    scores_label = "/".join(compact_score(score) for _, score in events)
+    return f"{label}: {event_labels} {scores_label}"
 
 
 def direction_event_debug_lines(
@@ -292,11 +420,12 @@ def direction_event_debug_lines(
     requested_device=None,
     resolved_device=None,
     resolved_dtype=None,
+    teacher_model=None,
     radar_latency_ms=None,
     ast_latency_ms=None,
 ):
     _ = max_lines
-    header = direction_event_debug_header(status, requested_device, resolved_device, resolved_dtype)
+    header = direction_event_debug_header(status, requested_device, resolved_device, resolved_dtype, teacher_model)
     if prediction is None:
         return [header, direction_latency_debug_line(radar_latency_ms, ast_latency_ms), "waiting for audio/model..."]
 
@@ -323,6 +452,83 @@ def normalize_degrees(angle):
 
 def sector_mid_angle_deg(sector):
     return normalize_degrees(arc_start_deg_for_position(sector) + 15)
+
+
+def is_classified_event_kind(kind):
+    return kind in CLASSIFIED_EVENT_KINDS
+
+
+def event_icon_center(
+    sector,
+    min_side,
+    center_x,
+    center_y,
+    distance_ratio=EVENT_ICON_DISTANCE_RATIO,
+    lane_index=0,
+    lane_count=1,
+    lane_spacing_ratio=EVENT_ICON_STACK_SPACING_RATIO,
+):
+    angle_rad = math.radians(sector_mid_angle_deg(sector))
+    distance = float(min_side) * float(distance_ratio)
+    lane_count = max(1, int(lane_count))
+    lane_index = clamp(float(lane_index), 0.0, float(lane_count - 1))
+    lane_offset = (lane_index - (lane_count - 1) * 0.5) * float(min_side) * float(lane_spacing_ratio)
+    return QtCore.QPointF(
+        float(center_x) + math.cos(angle_rad) * distance - math.sin(angle_rad) * lane_offset,
+        float(center_y) - math.sin(angle_rad) * distance - math.cos(angle_rad) * lane_offset,
+    )
+
+
+def event_icon_size(pulse, now, min_side):
+    strength = clamp(float(getattr(pulse, "strength", 0.0)))
+    base_ratio = EVENT_ICON_MIN_SIZE_RATIO + (EVENT_ICON_MAX_SIZE_RATIO - EVENT_ICON_MIN_SIZE_RATIO) * math.sqrt(strength)
+    age = pulse_age_ratio(pulse, now)
+    pop = 1.0 + EVENT_ICON_POP_SCALE * max(0.0, 1.0 - age / EVENT_ICON_POP_AGE_RATIO)
+    return float(min_side) * base_ratio * pop
+
+
+def event_icon_opacity(pulse, now):
+    age = pulse_age_ratio(pulse, now)
+    if age >= 1.0:
+        return 0.0
+    visibility = 0.68 + 0.32 * clamp(float(getattr(pulse, "strength", 0.0)))
+    if age <= EVENT_ICON_HOLD_AGE_RATIO:
+        return visibility
+    fade = (1.0 - age) / max(1e-6, 1.0 - EVENT_ICON_HOLD_AGE_RATIO)
+    return visibility * (fade ** 1.25)
+
+
+def event_icon_color(pulse, now):
+    red, green, blue, alpha = EVENT_ICON_RGBA
+    return QtGui.QColor(red, green, blue, int(clamp(alpha * event_icon_opacity(pulse, now), 0, 255)))
+
+
+def event_icon_shadow_color(pulse, now):
+    red, green, blue, alpha = EVENT_ICON_SHADOW_RGBA
+    return QtGui.QColor(red, green, blue, int(clamp(alpha * event_icon_opacity(pulse, now), 0, 255)))
+
+
+def event_icon_accent_color(pulse, now):
+    red, green, blue, alpha = color_rgba_for_kind(pulse.kind, EVENT_ICON_RGBA)
+    return QtGui.QColor(red, green, blue, int(clamp(alpha * event_icon_opacity(pulse, now), 0, 255)))
+
+
+def event_icon_badge_color(pulse, now):
+    red, green, blue, alpha = EVENT_ICON_BADGE_RGBA
+    return QtGui.QColor(red, green, blue, int(clamp(alpha * event_icon_opacity(pulse, now), 0, 255)))
+
+
+def event_icon_label(kind):
+    return EVENT_ICON_LABELS.get(kind, str(kind or "?").upper()[:4])
+
+
+def event_star_polygon(point_count, inner_radius, outer_radius, rotation_deg=90.0):
+    points = []
+    for index in range(point_count * 2):
+        radius = outer_radius if index % 2 == 0 else inner_radius
+        angle = math.radians(rotation_deg + index * 180.0 / point_count)
+        points.append(QtCore.QPointF(math.cos(angle) * radius, -math.sin(angle) * radius))
+    return QtGui.QPolygonF(points)
 
 
 def pulse_ripple_radius(pulse, now, min_side):
@@ -377,6 +583,7 @@ def color_rgba_for_kind(kind, fallback_rgba):
 
 
 def watercolor_color(strength, opacity, kind="unknown"):
+    _ = kind
     color_level = watercolor_color_level(strength)
     if color_level < 0.25:
         rgba = (72, 210, 116, 112)
@@ -386,12 +593,12 @@ def watercolor_color(strength, opacity, kind="unknown"):
         rgba = (238, 198, 68, 158)
     else:
         rgba = (238, 118, 48, 200)
-    rgba = color_rgba_for_kind(kind, rgba)
     red, green, blue, alpha = rgba
     return QtGui.QColor(red, green, blue, int(clamp(alpha * opacity * WATERCOLOR_ALPHA_MULTIPLIER, 0, 255)))
 
 
 def pulse_color(strength, opacity, kind="unknown"):
+    _ = kind
     strength = clamp(float(strength))
     if strength < 0.25:
         rgba = (60, 200, 60, 70)
@@ -401,7 +608,6 @@ def pulse_color(strength, opacity, kind="unknown"):
         rgba = (255, 220, 60, 160)
     else:
         rgba = (255, 120, 40, 230)
-    rgba = color_rgba_for_kind(kind, rgba)
     red, green, blue, alpha = rgba
     return QtGui.QColor(red, green, blue, int(clamp(alpha * opacity * opacity_multiplier, 0, 255)))
 
@@ -738,6 +944,112 @@ class RippleOverlayWidget(QtWidgets.QWidget):
             center_y - math.sin(angle_rad) * distance,
         )
 
+    def _event_icon_pen_width(self, size):
+        return max(2.0, size * 0.08)
+
+    def _draw_event_icon_badge(self, painter, size, badge_color, accent_color):
+        rect = QtCore.QRectF(-size * 0.66, -size * 0.60, size * 1.32, size * 1.36)
+        painter.setBrush(QtGui.QBrush(badge_color))
+        painter.setPen(QtGui.QPen(accent_color, max(2.5, size * 0.055), QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
+        painter.drawRoundedRect(rect, size * 0.18, size * 0.18)
+
+    def _draw_event_icon_label(self, painter, label, size, color, shadow_color):
+        font = QtGui.QFont("Arial")
+        font.setBold(True)
+        font.setPixelSize(max(10, int(size * 0.22)))
+        rect = QtCore.QRectF(-size * 0.58, size * 0.30, size * 1.16, size * 0.34)
+        painter.setFont(font)
+        painter.setPen(QtGui.QPen(shadow_color, max(2.0, size * 0.04)))
+        painter.drawText(rect.translated(0, size * 0.025), QtCore.Qt.AlignCenter, label)
+        painter.setPen(color)
+        painter.drawText(rect, QtCore.Qt.AlignCenter, label)
+
+    def _draw_event_icon_gunshot(self, painter, size, color, accent_color, shadow_color):
+        pen_width = self._event_icon_pen_width(size)
+        painter.setBrush(QtGui.QBrush(accent_color))
+        painter.setPen(QtGui.QPen(shadow_color, pen_width, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
+        painter.drawPolygon(event_star_polygon(4, size * 0.14, size * 0.42, rotation_deg=45.0))
+        painter.setPen(QtGui.QPen(color, pen_width * 0.75, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+        painter.drawLine(QtCore.QPointF(-size * 0.44, size * 0.24), QtCore.QPointF(size * 0.18, -size * 0.18))
+        painter.drawEllipse(QtCore.QPointF(size * 0.24, -size * 0.22), size * 0.06, size * 0.06)
+
+    def _draw_event_icon_explosion(self, painter, size, color, accent_color, shadow_color):
+        painter.setBrush(QtGui.QBrush(accent_color))
+        painter.setPen(QtGui.QPen(shadow_color, self._event_icon_pen_width(size), QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
+        painter.drawPolygon(event_star_polygon(8, size * 0.22, size * 0.48, rotation_deg=90.0))
+        painter.setBrush(QtGui.QBrush(color))
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.drawEllipse(QtCore.QPointF(0, 0), size * 0.13, size * 0.13)
+
+    def _draw_event_icon_vehicle(self, painter, size, color, accent_color, shadow_color):
+        pen_width = self._event_icon_pen_width(size)
+        painter.setPen(QtGui.QPen(shadow_color, pen_width, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
+        painter.setBrush(QtGui.QBrush(accent_color))
+        body = QtCore.QRectF(-size * 0.42, -size * 0.18, size * 0.84, size * 0.34)
+        cabin = QtCore.QRectF(-size * 0.20, -size * 0.34, size * 0.40, size * 0.22)
+        painter.drawRoundedRect(body, size * 0.08, size * 0.08)
+        painter.drawRoundedRect(cabin, size * 0.06, size * 0.06)
+        painter.setBrush(QtGui.QBrush(color))
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.drawRect(QtCore.QRectF(-size * 0.13, -size * 0.29, size * 0.10, size * 0.12))
+        painter.drawRect(QtCore.QRectF(size * 0.03, -size * 0.29, size * 0.10, size * 0.12))
+        painter.setBrush(QtGui.QBrush(shadow_color))
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.drawEllipse(QtCore.QPointF(-size * 0.25, size * 0.20), size * 0.09, size * 0.09)
+        painter.drawEllipse(QtCore.QPointF(size * 0.25, size * 0.20), size * 0.09, size * 0.09)
+
+    def _draw_event_icon_footstep(self, painter, size, color, accent_color, shadow_color):
+        pen_width = self._event_icon_pen_width(size)
+        painter.setPen(QtGui.QPen(shadow_color, pen_width, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
+        painter.setBrush(QtGui.QBrush(accent_color))
+        for x_offset, y_offset, rotation in ((-0.16, 0.10, -20), (0.16, -0.12, -20)):
+            painter.save()
+            painter.translate(size * x_offset, size * y_offset)
+            painter.rotate(rotation)
+            painter.drawEllipse(QtCore.QRectF(-size * 0.13, -size * 0.23, size * 0.26, size * 0.46))
+            painter.setBrush(QtGui.QBrush(color))
+            for toe_x in (-0.09, 0.0, 0.09):
+                painter.drawEllipse(QtCore.QPointF(size * toe_x, -size * 0.26), size * 0.035, size * 0.035)
+            painter.setBrush(QtGui.QBrush(accent_color))
+            painter.restore()
+
+    def _paint_event_icon(self, painter, pulse, now, min_side, center_x, center_y):
+        if not is_classified_event_kind(pulse.kind):
+            return
+        color = event_icon_color(pulse, now)
+        if color.alpha() <= 0:
+            return
+        accent_color = event_icon_accent_color(pulse, now)
+        badge_color = event_icon_badge_color(pulse, now)
+        shadow_color = event_icon_shadow_color(pulse, now)
+        size = event_icon_size(pulse, now, min_side)
+        center = event_icon_center(
+            pulse.sector,
+            min_side,
+            center_x,
+            center_y,
+            lane_index=getattr(pulse, "lane_index", 0),
+            lane_count=getattr(pulse, "lane_count", 1),
+        )
+        painter.save()
+        painter.translate(center)
+        painter.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
+        self._draw_event_icon_badge(painter, size, badge_color, accent_color)
+        painter.save()
+        painter.translate(0, -size * 0.11)
+        glyph_size = size * 0.88
+        if pulse.kind == "gunshot":
+            self._draw_event_icon_gunshot(painter, glyph_size, color, accent_color, shadow_color)
+        elif pulse.kind == "explosion":
+            self._draw_event_icon_explosion(painter, glyph_size, color, accent_color, shadow_color)
+        elif pulse.kind == "vehicle":
+            self._draw_event_icon_vehicle(painter, glyph_size, color, accent_color, shadow_color)
+        elif pulse.kind == "footstep":
+            self._draw_event_icon_footstep(painter, glyph_size, color, accent_color, shadow_color)
+        painter.restore()
+        self._draw_event_icon_label(painter, event_icon_label(pulse.kind), size, color, shadow_color)
+        painter.restore()
+
     def _paint_watercolor_pulse(self, painter, pulse, now, min_side, center_x, center_y):
         specs = watercolor_blob_specs(pulse, now, min_side)
         age = pulse_age_ratio(pulse, now)
@@ -814,9 +1126,10 @@ class RippleOverlayWidget(QtWidgets.QWidget):
         requested_device = getattr(runtime, "device", AST_DIRECTION_EVENT_DEVICE)
         resolved_device = getattr(runtime, "resolved_device", None)
         resolved_dtype = getattr(runtime, "resolved_dtype", None)
+        teacher_model = getattr(runtime, "teacher_model", AST_DIRECTION_EVENT_TEACHER_MODEL)
         if getattr(runtime, "disabled_reason", None):
             return [
-                direction_event_debug_header("disabled", requested_device, resolved_device, resolved_dtype),
+                direction_event_debug_header("disabled", requested_device, resolved_device, resolved_dtype, teacher_model),
                 f"{runtime.disabled_reason[:64]}",
             ]
         status = "running" if getattr(runtime, "_future", None) is not None else "idle"
@@ -826,6 +1139,7 @@ class RippleOverlayWidget(QtWidgets.QWidget):
             requested_device=requested_device,
             resolved_device=resolved_device,
             resolved_dtype=resolved_dtype,
+            teacher_model=teacher_model,
             radar_latency_ms=getattr(parent, "radar_latency_ms", None),
             ast_latency_ms=getattr(parent, "ast_latency_ms", None),
         )
@@ -880,7 +1194,9 @@ class RippleOverlayWidget(QtWidgets.QWidget):
         for pulse in list(getattr(parent, "pulses", [])):
             if pulse_opacity(pulse, now) <= 0:
                 continue
-            if RIPPLE_STYLE == "watercolor":
+            if is_classified_event_kind(pulse.kind):
+                self._paint_event_icon(painter, pulse, now, min_side, center_x, center_y)
+            elif RIPPLE_STYLE == "watercolor":
                 self._paint_watercolor_pulse(painter, pulse, now, min_side, center_x, center_y)
             else:
                 self._paint_arc_ripple(painter, pulse, now, min_side, center_x, center_y)
@@ -1002,25 +1318,36 @@ class DirectionEventRuntime:
         top_k=AST_DIRECTION_EVENT_TOP_K,
         device=AST_DIRECTION_EVENT_DEVICE,
         dtype=AST_DIRECTION_EVENT_DTYPE,
+        attn_implementation=AST_DIRECTION_EVENT_ATTN_IMPLEMENTATION,
+        compile_model=AST_DIRECTION_EVENT_COMPILE,
+        teacher_model=AST_DIRECTION_EVENT_TEACHER_MODEL,
         model_id=None,
+        channel_map=None,
         executor=None,
         score_fn=None,
         latency_clock=None,
+        warmup=AST_DIRECTION_EVENT_WARMUP,
     ):
         self.sample_rate = int(sample_rate)
         self.channel_count = int(channel_count)
-        self.max_samples = max(1, int(self.sample_rate * float(window_seconds)))
+        self.window_seconds = float(window_seconds)
+        self.max_samples = max(1, int(self.sample_rate * self.window_seconds))
         self.interval_seconds = float(interval_seconds)
         self.top_k = int(top_k)
         self.device = device
         self.dtype = dtype
+        self.attn_implementation = attn_implementation
+        self.compile_model = compile_model
+        self.teacher_model = teacher_model
         self.model_id = model_id
+        self.channel_map = dict(channel_map) if channel_map is not None else None
         self._score_fn = score_fn or self._score_with_ast_teacher
         self._executor = executor or concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="soundradar-ast")
         self._latency_clock = latency_clock or time.perf_counter
         self._future = None
         self._future_capture_time = None
         self._teacher = None
+        self._warmup_future = None
         self._last_submit_time = -float("inf")
         self._audio = np.zeros((0, self.channel_count), dtype=np.float32)
         self.latest_audio_capture_time = None
@@ -1029,6 +1356,9 @@ class DirectionEventRuntime:
         self.disabled_reason = None
         self.resolved_device = None
         self.resolved_dtype = None
+        if warmup and score_fn is None:
+            self._warmup_future = self._executor.submit(self._warmup_ast_teacher)
+            self.poll_warmup()
 
     def append_blocks(self, blocks, capture_time=None):
         prepared = []
@@ -1057,16 +1387,31 @@ class DirectionEventRuntime:
                 self.latest_latency_ms = max(0.0, (self._latency_clock() - self._future_capture_time) * 1000.0)
         except Exception as exc:
             self.disabled_reason = str(exc)
-            print(f"AST direction events disabled: {exc}", file=sys.stderr)
+            print(f"Direction event teacher disabled: {exc}", file=sys.stderr)
             self.latest_prediction = None
         finally:
             self._future = None
             self._future_capture_time = None
         return self.latest_prediction
 
+    def poll_warmup(self):
+        if self._warmup_future is None:
+            return True
+        if not self._warmup_future.done():
+            return False
+        try:
+            self._warmup_future.result()
+        except Exception as exc:
+            self.disabled_reason = str(exc)
+            print(f"Direction event teacher disabled during warmup: {exc}", file=sys.stderr)
+        finally:
+            self._warmup_future = None
+        return self.disabled_reason is None
+
     def maybe_submit(self, now):
         prediction = self.poll()
-        if self.disabled_reason is not None or self._future is not None:
+        self.poll_warmup()
+        if self.disabled_reason is not None or self._future is not None or self._warmup_future is not None:
             return prediction
         if self._audio.shape[0] < self.max_samples:
             return prediction
@@ -1078,19 +1423,44 @@ class DirectionEventRuntime:
         self._future = self._executor.submit(self._score_fn, window, self.sample_rate, self.top_k, "<live>")
         return self.poll() if self._future.done() else prediction
 
-    def _score_with_ast_teacher(self, audio, sample_rate, top_k, source_path):
-        from sound_model.ast_teacher import AST_MODEL_ID, AstAudioSetTeacher
-        from sound_model.direction_events import score_direction_events
+    def _ensure_ast_teacher(self):
+        from sound_model.ast_teacher import create_audio_event_teacher
 
         if self._teacher is None:
-            self._teacher = AstAudioSetTeacher(self.model_id or AST_MODEL_ID, device=self.device, dtype=self.dtype)
+            self._teacher = create_audio_event_teacher(
+                self.teacher_model,
+                model_id=self.model_id,
+                device=self.device,
+                dtype=self.dtype,
+                attn_implementation=self.attn_implementation,
+                compile_model=self.compile_model,
+            )
         resolved_device = str(getattr(self._teacher, "device", self.device))
         resolved_dtype = str(getattr(self._teacher, "dtype", self.dtype)).replace("torch.", "")
         if self.resolved_device != resolved_device or self.resolved_dtype != resolved_dtype:
             self.resolved_device = resolved_device
             self.resolved_dtype = resolved_dtype
-            print(f"AST teacher device: {resolved_device} dtype: {resolved_dtype}")
-        return score_direction_events(audio, sample_rate, self._teacher, top_k=top_k, source_path=source_path)
+            print(f"Direction event teacher {self.teacher_model} device: {resolved_device} dtype: {resolved_dtype}")
+        return self._teacher
+
+    def _warmup_ast_teacher(self):
+        teacher = self._ensure_ast_teacher()
+        warmup = getattr(teacher, "warmup_direction_batch", None)
+        if callable(warmup):
+            warmup(sample_rate=self.sample_rate, seconds=self.window_seconds, direction_count=7)
+
+    def _score_with_ast_teacher(self, audio, sample_rate, top_k, source_path):
+        from sound_model.direction_events import score_direction_events
+
+        teacher = self._ensure_ast_teacher()
+        return score_direction_events(
+            audio,
+            sample_rate,
+            teacher,
+            top_k=top_k,
+            source_path=source_path,
+            channel_map=self.channel_map,
+        )
 
 
 def unpack_audio_queue_item(item):
@@ -1426,7 +1796,7 @@ def configure_audio_mapping(device_info):
         print("Warning: this device is not exposing 7.1 input. Direction display is limited.")
 
 
-def configure_direction_event_runtime(window, sample_rate, channel_count):
+def configure_direction_event_runtime(window, sample_rate, channel_count, channel_map=None):
     if not ENABLE_AST_DIRECTION_EVENTS:
         return False
     window.direction_event_runtime = DirectionEventRuntime(
@@ -1437,10 +1807,16 @@ def configure_direction_event_runtime(window, sample_rate, channel_count):
         top_k=AST_DIRECTION_EVENT_TOP_K,
         device=AST_DIRECTION_EVENT_DEVICE,
         dtype=AST_DIRECTION_EVENT_DTYPE,
+        attn_implementation=AST_DIRECTION_EVENT_ATTN_IMPLEMENTATION,
+        compile_model=AST_DIRECTION_EVENT_COMPILE,
+        teacher_model=AST_DIRECTION_EVENT_TEACHER_MODEL,
+        model_id=AST_DIRECTION_EVENT_MODEL_ID,
+        channel_map=channel_map,
     )
     print(
-        "AST direction-event overlay enabled "
-        f"({AST_DIRECTION_EVENT_WINDOW_SECONDS:.1f}s window, {AST_DIRECTION_EVENT_INTERVAL:.2f}s interval, {AST_DIRECTION_EVENT_DEVICE}, {AST_DIRECTION_EVENT_DTYPE})."
+        "Audio direction-event overlay enabled "
+        f"({AST_DIRECTION_EVENT_TEACHER_MODEL}, {AST_DIRECTION_EVENT_WINDOW_SECONDS:.1f}s window, "
+        f"{AST_DIRECTION_EVENT_INTERVAL:.2f}s interval, {AST_DIRECTION_EVENT_DEVICE}, {AST_DIRECTION_EVENT_DTYPE})."
     )
     return True
 
@@ -1454,7 +1830,7 @@ def main():
     device_id, device_info = select_input_device()
     assert device_info is not None
     configure_audio_mapping(device_info)
-    configure_direction_event_runtime(window, device_info.get("default_samplerate", 44_100), n_chans)
+    configure_direction_event_runtime(window, device_info.get("default_samplerate", 44_100), n_chans, mapping)
     print("Make sure system Sound Output is set to BlackHole/Loopback/VB-Cable or a Multi-Output device that includes it.")
 
     stream = sd.InputStream(

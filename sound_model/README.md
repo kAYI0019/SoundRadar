@@ -101,7 +101,8 @@ seven coarse directions, run the same AST teacher once per direction, and emit a
 ```sh
 .venv/bin/python -m sound_model.direction_events \
   /Users/min/Downloads/gun_sound_v2/ak_0m_center_0000.mp3 \
-  --device cpu \
+  --device auto \
+  --dtype auto \
   --top-k 5
 ```
 
@@ -120,6 +121,65 @@ Input behavior:
 
 This is intended for teacher/pseudo-labeling and prototyping. Real-time use will
 likely need batching, cooldown/smoothing, and eventually a smaller student model.
+
+## Full 7-direction benchmark
+
+Use the benchmark CLI before and after optimization, or when comparing MPS vs
+CUDA/RTX 3070.  It keeps the full seven-direction batch and reports stage timing
+for direction extraction, feature extraction, device transfer, model forward, and
+postprocess.
+
+Synthetic 8-channel input:
+
+```sh
+.venv/bin/python -m sound_model.benchmark_ast_direction \
+  --device auto \
+  --dtype auto \
+  --runs 5 \
+  --warmups 1
+```
+
+Real file input:
+
+```sh
+.venv/bin/python -m sound_model.benchmark_ast_direction \
+  /Users/min/Downloads/gun_sound_v2/ak_0m_center_0000.mp3 \
+  --device auto \
+  --dtype auto \
+  --runs 5 \
+  --warmups 1
+```
+
+On an RTX 3070 machine, compare CUDA fp16 first:
+
+```sh
+.venv/bin/python -m sound_model.benchmark_ast_direction sample.wav \
+  --device cuda \
+  --dtype float16 \
+  --runs 5 \
+  --warmups 1
+```
+
+Then test optional CUDA-only acceleration knobs independently:
+
+```sh
+# Try PyTorch's SDPA attention path if this Transformers/PyTorch combo supports it.
+.venv/bin/python -m sound_model.benchmark_ast_direction sample.wav \
+  --device cuda \
+  --dtype float16 \
+  --attn-implementation sdpa \
+  --runs 5 \
+  --warmups 1
+
+# Try torch.compile. The first warmup can be much slower because it compiles.
+.venv/bin/python -m sound_model.benchmark_ast_direction sample.wav \
+  --device cuda \
+  --dtype float16 \
+  --compile-model \
+  --compile-mode reduce-overhead \
+  --runs 5 \
+  --warmups 1
+```
 
 ## Important limitation
 

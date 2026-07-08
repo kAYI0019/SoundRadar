@@ -1,18 +1,96 @@
+from types import SimpleNamespace
 import unittest
 import warnings
 
+import numpy as np
+
 from sound_model.audio_features import DEFAULT_CLASSES
 from sound_model.ast_teacher import (
+    AstAudioSetTeacher,
+    EfficientATAudioSetTeacher,
     active_soundradar_events,
+    build_audioset_background_indices,
+    build_audioset_event_indices,
+    create_audio_event_teacher,
+    configure_torch_runtime_for_device,
+    compile_torch_model_if_requested,
+    normalize_teacher_model_choice,
+    _label_matches,
     _from_pretrained_prefer_cache,
     _load_ast_feature_extractor,
     _resolve_torch_dtype,
     _resolve_torch_device,
+    map_audioset_logits_to_events,
     map_audioset_scores_to_events,
+    map_audioset_probabilities_to_events,
+    top_k_label_scores,
 )
 
 
 class AstTeacherMappingTests(unittest.TestCase):
+    def test_normalize_teacher_model_choice_keeps_ast_and_maps_efficientat_aliases(self):
+        self.assertEqual(
+            normalize_teacher_model_choice("ast"),
+            ("ast", "MIT/ast-finetuned-audioset-10-10-0.4593"),
+        )
+        self.assertEqual(normalize_teacher_model_choice("efficientat-mn10"), ("efficientat", "mn10_as"))
+        self.assertEqual(normalize_teacher_model_choice("efficientat-mn20"), ("efficientat", "mn20_as"))
+        self.assertEqual(normalize_teacher_model_choice("mn10_as"), ("efficientat", "mn10_as"))
+        self.assertEqual(normalize_teacher_model_choice("mn20_as"), ("efficientat", "mn20_as"))
+
+    def test_create_audio_event_teacher_can_select_ast_or_efficientat(self):
+        class FakeAstTeacher:
+            def __init__(self, model_id, **kwargs):
+                self.model_id = model_id
+                self.kwargs = kwargs
+
+        class FakeEfficientTeacher:
+            def __init__(self, model_id, **kwargs):
+                self.model_id = model_id
+                self.kwargs = kwargs
+
+        ast_teacher = create_audio_event_teacher(
+            "ast",
+            device="cpu",
+            dtype="float32",
+            ast_cls=FakeAstTeacher,
+            efficientat_cls=FakeEfficientTeacher,
+        )
+        efficient_teacher = create_audio_event_teacher(
+            "efficientat-mn20",
+            device="cpu",
+            dtype="float32",
+            ast_cls=FakeAstTeacher,
+            efficientat_cls=FakeEfficientTeacher,
+        )
+
+        self.assertIsInstance(ast_teacher, FakeAstTeacher)
+        self.assertEqual(ast_teacher.model_id, "MIT/ast-finetuned-audioset-10-10-0.4593")
+        self.assertIsInstance(efficient_teacher, FakeEfficientTeacher)
+        self.assertEqual(efficient_teacher.model_id, "mn20_as")
+        self.assertEqual(efficient_teacher.kwargs["device"], "cpu")
+
+    def test_efficientat_warmup_direction_batch_runs_seven_zero_waveforms(self):
+        class ProbeTeacher(EfficientATAudioSetTeacher):
+            def __init__(self):
+                self.calls = []
+
+            def predict_waveforms(self, waveforms, sample_rate, *, top_k=12, audio_paths=None):
+                self.calls.append((waveforms, sample_rate, top_k, audio_paths))
+                return []
+
+        teacher = ProbeTeacher()
+
+        teacher.warmup_direction_batch(sample_rate=10, seconds=0.5, direction_count=7)
+
+        waveforms, sample_rate, top_k, audio_paths = teacher.calls[0]
+        self.assertEqual(sample_rate, 10)
+        self.assertEqual(top_k, 1)
+        self.assertEqual(audio_paths, ["warmup_0", "warmup_1", "warmup_2", "warmup_3", "warmup_4", "warmup_5", "warmup_6"])
+        self.assertEqual(len(waveforms), 7)
+        for waveform in waveforms:
+            np.testing.assert_array_equal(waveform, np.zeros(5, dtype=np.float32))
+
     def test_auto_device_prefers_cuda_then_mps_then_cpu(self):
         class FakeDevice:
             def __init__(self, name):
@@ -66,6 +144,65 @@ class AstTeacherMappingTests(unittest.TestCase):
         self.assertIs(_resolve_torch_dtype(FakeTorch, "auto", FakeDevice("cpu")), FakeTorch.float32)
         self.assertIs(_resolve_torch_dtype(FakeTorch, "bfloat16", FakeDevice("cuda")), FakeTorch.bfloat16)
 
+    def test_configure_torch_runtime_enables_cuda_fast_paths_only_for_cuda(self):
+        class FakeDevice:
+            def __init__(self, name):
+                self.type = name
+
+        class FakeCudnn:
+            benchmark = False
+
+        class FakeBackends:
+            cudnn = FakeCudnn()
+
+        class FakeTorch:
+            backends = FakeBackends()
+
+            def __init__(self):
+                self.precision_calls = []
+
+            def set_float32_matmul_precision(self, value):
+                self.precision_calls.append(value)
+
+        torch_module = FakeTorch()
+
+        configure_torch_runtime_for_device(torch_module, FakeDevice("cuda"))
+
+        self.assertTrue(torch_module.backends.cudnn.benchmark)
+        self.assertEqual(torch_module.precision_calls, ["high"])
+
+        torch_module.backends.cudnn.benchmark = False
+        torch_module.precision_calls.clear()
+        configure_torch_runtime_for_device(torch_module, FakeDevice("mps"))
+
+        self.assertFalse(torch_module.backends.cudnn.benchmark)
+        self.assertEqual(torch_module.precision_calls, [])
+
+    def test_compile_torch_model_if_requested_uses_reduce_overhead_by_default(self):
+        class FakeTorch:
+            def __init__(self):
+                self.calls = []
+
+            def compile(self, model, *, mode=None):
+                self.calls.append((model, mode))
+                return f"compiled:{mode}:{model}"
+
+        torch_module = FakeTorch()
+
+        self.assertEqual(compile_torch_model_if_requested(torch_module, "model", True), "compiled:reduce-overhead:model")
+        self.assertEqual(torch_module.calls, [("model", "reduce-overhead")])
+
+    def test_compile_torch_model_if_requested_accepts_explicit_mode(self):
+        class FakeTorch:
+            def compile(self, model, *, mode=None):
+                return (model, mode)
+
+        self.assertEqual(compile_torch_model_if_requested(FakeTorch(), "model", "max-autotune"), ("model", "max-autotune"))
+
+    def test_compile_torch_model_if_requested_rejects_missing_compile(self):
+        with self.assertRaisesRegex(RuntimeError, "torch.compile"):
+            compile_torch_model_if_requested(object(), "model", True)
+
     def test_requested_cuda_requires_available_cuda_backend(self):
         class FakeDevice:
             def __init__(self, name):
@@ -101,6 +238,58 @@ class AstTeacherMappingTests(unittest.TestCase):
         self.assertAlmostEqual(mapped["vehicle"], 0.64)
         self.assertAlmostEqual(mapped["footstep"], 0.55)
 
+    def test_label_matching_does_not_match_keyword_inside_unrelated_words(self):
+        self.assertTrue(_label_matches("Car alarm", ("car",)))
+        self.assertTrue(_label_matches("Gunshot, gunfire", ("gunfire",)))
+        self.assertTrue(_label_matches("Walk, footsteps", ("walk, footsteps",)))
+
+        self.assertFalse(_label_matches("Carnatic music", ("car",)))
+        self.assertFalse(_label_matches("Grunt", ("run",)))
+        self.assertFalse(_label_matches("Grunge", ("run",)))
+
+    def test_efficientat_logit_mapping_uses_relative_evidence_not_saturated_sigmoid(self):
+        labels = (
+            "Motor vehicle (road)",
+            "Speech",
+            "Gunshot, gunfire",
+            "Explosion",
+            "Boom",
+        )
+        # EfficientAT can emit very large positive logits where sigmoid(logit)
+        # would be ~1.0 for every target class. The mapping should keep the top
+        # relative event while not promoting distant positive logits.
+        logits = np.array([120.0, 110.0, 95.0, 80.0, 70.0], dtype=np.float32)
+
+        mapped = map_audioset_logits_to_events(logits, labels, temperature=8.0)
+
+        self.assertGreater(mapped["vehicle"], 0.9)
+        self.assertLess(mapped["gunshot"], 0.1)
+        self.assertLess(mapped["explosion"], 0.1)
+
+    def test_vehicle_mapping_includes_engine_and_road_vehicle_motion_labels(self):
+        mapped = map_audioset_scores_to_events(
+            {
+                "Accelerating, revving, vroom": 0.74,
+                "Idling": 0.70,
+                "Engine": 0.66,
+                "Traffic noise, roadway noise": 0.62,
+                "Speech": 0.95,
+            }
+        )
+
+        self.assertAlmostEqual(mapped["vehicle"], 0.74)
+
+    def test_vehicle_mapping_ignores_broad_mechanical_false_positives(self):
+        labels = (
+            "Train wheels squealing",
+            "Gunshot, gunfire",
+        )
+        logits = np.array([120.0, 80.0], dtype=np.float32)
+
+        mapped = map_audioset_logits_to_events(logits, labels, temperature=8.0)
+
+        self.assertEqual(mapped["vehicle"], 0.0)
+
     def test_background_means_no_target_sound_event(self):
         mapped = map_audioset_scores_to_events({"Speech": 0.95, "Music": 0.88})
 
@@ -114,6 +303,126 @@ class AstTeacherMappingTests(unittest.TestCase):
         mapped = map_audioset_scores_to_events({"Gunshot, gunfire": 0.84})
 
         self.assertAlmostEqual(mapped["background"], 0.16)
+
+    def test_probability_mapping_matches_label_score_mapping(self):
+        labels = (
+            "Speech",
+            "Gunshot, gunfire",
+            "Walk, footsteps",
+            "Car",
+            "Explosion",
+            "Silence",
+        )
+        probabilities = np.array([0.95, 0.42, 0.31, 0.22, 0.55, 0.77], dtype=np.float32)
+
+        event_indices = build_audioset_event_indices(labels)
+        background_indices = build_audioset_background_indices(labels)
+        indexed = map_audioset_probabilities_to_events(
+            probabilities,
+            labels,
+            event_indices=event_indices,
+            background_indices=background_indices,
+        )
+        dict_mapped = map_audioset_scores_to_events(dict(zip(labels, probabilities)))
+
+        for event_name in DEFAULT_CLASSES:
+            self.assertAlmostEqual(indexed[event_name], dict_mapped[event_name])
+
+    def test_top_k_label_scores_returns_only_requested_sorted_labels(self):
+        labels = ("quiet", "gun", "foot", "vehicle")
+        probabilities = np.array([0.1, 0.8, 0.3, 0.6], dtype=np.float32)
+
+        top_labels = top_k_label_scores(probabilities, labels, top_k=2)
+
+        self.assertEqual(top_labels, [{"label": "gun", "score": 0.8}, {"label": "vehicle", "score": 0.6}])
+
+    def test_predict_waveforms_uses_torch_inference_mode(self):
+        class FakeInput:
+            def is_floating_point(self):
+                return True
+
+            def to(self, *args, **kwargs):
+                self.to_args = args
+                self.to_kwargs = kwargs
+                return self
+
+        class FakeProbabilities:
+            def detach(self):
+                return self
+
+            def cpu(self):
+                return self
+
+            def numpy(self):
+                return np.array([[0.0, 0.6, 0.0, 0.0]], dtype=np.float32)
+
+        class FakeContext:
+            def __init__(self, torch_module, name):
+                self.torch_module = torch_module
+                self.name = name
+
+            def __enter__(self):
+                setattr(self.torch_module, f"{self.name}_entered", True)
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeTorch:
+            inference_mode_entered = False
+            no_grad_entered = False
+
+            def inference_mode(self):
+                return FakeContext(self, "inference_mode")
+
+            def no_grad(self):
+                return FakeContext(self, "no_grad")
+
+            def sigmoid(self, logits):
+                return FakeProbabilities()
+
+        class FakeModel:
+            config = SimpleNamespace(id2label={0: "Speech", 1: "Gunshot, gunfire", 2: "Car", 3: "Silence"})
+
+            def __call__(self, **inputs):
+                return SimpleNamespace(logits=object())
+
+        fake_torch = FakeTorch()
+        teacher = AstAudioSetTeacher.__new__(AstAudioSetTeacher)
+        teacher.model_id = "fake-model"
+        teacher.torch = fake_torch
+        teacher.feature_extractor = lambda waveforms, sampling_rate, return_tensors: {"input_values": FakeInput()}
+        teacher.model = FakeModel()
+        teacher.dtype = "float16"
+        teacher.device = "cuda"
+        teacher._labels = ("Speech", "Gunshot, gunfire", "Car", "Silence")
+        teacher._event_label_indices = build_audioset_event_indices(teacher._labels)
+        teacher._background_label_indices = build_audioset_background_indices(teacher._labels)
+
+        teacher.predict_waveforms([np.zeros(4, dtype=np.float32)], 16_000, top_k=2)
+
+        self.assertTrue(fake_torch.inference_mode_entered)
+        self.assertFalse(fake_torch.no_grad_entered)
+
+    def test_warmup_direction_batch_runs_seven_zero_waveforms(self):
+        class ProbeTeacher(AstAudioSetTeacher):
+            def __init__(self):
+                self.calls = []
+
+            def predict_waveforms(self, waveforms, sample_rate, *, top_k=12, audio_paths=None):
+                self.calls.append((waveforms, sample_rate, top_k, audio_paths))
+                return []
+
+        teacher = ProbeTeacher()
+
+        teacher.warmup_direction_batch(sample_rate=10, seconds=0.5, direction_count=7)
+
+        waveforms, sample_rate, top_k, audio_paths = teacher.calls[0]
+        self.assertEqual(sample_rate, 10)
+        self.assertEqual(top_k, 1)
+        self.assertEqual(audio_paths, ["warmup_0", "warmup_1", "warmup_2", "warmup_3", "warmup_4", "warmup_5", "warmup_6"])
+        self.assertEqual(len(waveforms), 7)
+        for waveform in waveforms:
+            np.testing.assert_array_equal(waveform, np.zeros(5, dtype=np.float32))
 
     def test_ast_teacher_uses_lower_default_threshold_for_gunshot(self):
         active = active_soundradar_events(
