@@ -591,6 +591,53 @@ class SoundRadarPulseTests(unittest.TestCase):
         self.assertEqual(blocked, [])
         self.assertEqual(len(allowed), 1)
 
+    def test_direction_event_prediction_reports_gunshot_display_debug(self):
+        prediction = SimpleNamespace(
+            direction_event_scores={
+                "front": {"gunshot": 0.31, "footstep": 0.0, "vehicle": 0.0, "explosion": 0.0},
+                "front_right": {"gunshot": 0.72, "footstep": 0.0, "vehicle": 0.0, "explosion": 0.0},
+                "right": {"gunshot": 0.26, "footstep": 0.0, "vehicle": 0.0, "explosion": 0.0},
+            },
+            active_events_by_direction={
+                "front": ["gunshot"],
+                "front_right": ["gunshot"],
+                "right": ["gunshot"],
+            },
+        )
+        display_debug = {}
+
+        soundRadar.create_pulses_from_direction_events(
+            prediction,
+            now=10.0,
+            threshold=0.1,
+            display_debug=display_debug,
+        )
+
+        debug = display_debug["debug"]
+        self.assertEqual(debug.gunshot_emitted_directions, ("front_right",))
+        self.assertEqual(debug.gunshot_decision.allowed_directions, frozenset(("front_right",)))
+        self.assertEqual(debug.gunshot_decision.spatially_suppressed_directions, frozenset(("front", "right")))
+
+    def test_direction_event_prediction_reports_global_gunshot_cooldown_debug(self):
+        prediction = SimpleNamespace(
+            direction_event_scores={
+                "right": {"gunshot": 0.8, "footstep": 0.0, "vehicle": 0.0, "explosion": 0.0},
+            },
+            active_events_by_direction={"right": ["gunshot"]},
+        )
+        display_debug = {}
+
+        pulses = soundRadar.create_pulses_from_direction_events(
+            prediction,
+            now=10.05,
+            threshold=0.1,
+            last_global_event_times={"gunshot": 10.0},
+            display_debug=display_debug,
+        )
+
+        self.assertEqual(pulses, [])
+        self.assertEqual(display_debug["debug"].gunshot_global_cooldown_blocked_directions, ("right",))
+
     def test_direction_event_prediction_creates_multiple_event_icons_per_sector(self):
         prediction = SimpleNamespace(
             direction_event_scores={
@@ -713,10 +760,49 @@ class SoundRadarPulseTests(unittest.TestCase):
 
         self.assertEqual(lines[0], "efficientat-mn10 idle auto→mps")
         self.assertEqual(lines[1], "lag radar 18ms model 255ms Δ+237ms")
-        self.assertIn("F: --", lines[2])
-        self.assertIn("L: FOOT .92", lines[4])
-        self.assertIn("R: GUN .80", lines[4])
-        self.assertIn("RR: VEH .88", lines[5])
+        self.assertIn("gun cand R .80", lines[2])
+        self.assertIn("show R", lines[2])
+        self.assertIn("F: --", lines[3])
+        self.assertIn("L: FOOT .92", lines[5])
+        self.assertIn("R: GUN .80", lines[5])
+        self.assertIn("RR: VEH .88", lines[6])
+
+    def test_direction_event_debug_lines_show_gunshot_suppression_and_cooldown(self):
+        prediction = SimpleNamespace(
+            direction_event_scores={
+                "front": {"gunshot": 0.31, "footstep": 0.0, "vehicle": 0.0, "explosion": 0.0},
+                "front_right": {"gunshot": 0.72, "footstep": 0.0, "vehicle": 0.0, "explosion": 0.0},
+                "right": {"gunshot": 0.26, "footstep": 0.0, "vehicle": 0.0, "explosion": 0.0},
+            },
+            active_events_by_direction={
+                "front": ["gunshot"],
+                "front_right": ["gunshot"],
+                "right": ["gunshot"],
+            },
+        )
+        display_debug = {
+            "debug": soundRadar.DirectionEventPulseDebug(
+                gunshot_decision=soundRadar.gunshot_display_decision(
+                    prediction.direction_event_scores,
+                    prediction.active_events_by_direction,
+                    threshold=0.1,
+                ),
+                gunshot_emitted_directions=(),
+                gunshot_global_cooldown_blocked_directions=("front_right",),
+                gunshot_sector_cooldown_blocked_directions=(),
+            )
+        }
+
+        lines = soundRadar.direction_event_debug_lines(
+            prediction,
+            threshold=0.1,
+            display_debug=display_debug["debug"],
+        )
+
+        self.assertIn("cand FR .72,F .31,R .26", lines[2])
+        self.assertIn("show --", lines[2])
+        self.assertIn("sup F/R", lines[2])
+        self.assertIn("cd G:FR", lines[2])
 
     def test_direction_event_runtime_device_label_shows_mps_resolution(self):
         runtime = soundRadar.DirectionEventRuntime(sample_rate=16_000, channel_count=8, device="auto", warmup=False)

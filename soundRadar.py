@@ -77,21 +77,26 @@ AST_DIRECTION_EVENT_THRESHOLD = 0.10
 AST_DIRECTION_EVENT_COOLDOWN = 0.55
 AST_DIRECTION_EVENT_WARMUP = True
 SHOW_EVENT_DEBUG_TEXT = True
-EVENT_DEBUG_MAX_LINES = 6
+EVENT_DEBUG_MAX_LINES = 7
+DIRECTION_EVENT_GUNSHOT_DISPLAY_THRESHOLD = 0.10
+DIRECTION_EVENT_GUNSHOT_SECONDARY_THRESHOLD = 0.35
 DIRECTION_EVENT_DISPLAY_THRESHOLDS = {
-    "gunshot": 0.10,
+    "gunshot": DIRECTION_EVENT_GUNSHOT_DISPLAY_THRESHOLD,
     "explosion": 0.85,
     "vehicle": 0.60,
     "footstep": 0.85,
 }
 DIRECTION_EVENT_SECONDARY_DISPLAY_THRESHOLDS = {
-    "gunshot": 0.35,
+    "gunshot": DIRECTION_EVENT_GUNSHOT_SECONDARY_THRESHOLD,
     "explosion": 0.85,
     "vehicle": 0.60,
     "footstep": 0.85,
 }
 DIRECTION_EVENT_GUNSHOT_BIAS_MARGIN = 0.25
 DIRECTION_EVENT_MAX_ICONS_PER_DIRECTION = 2
+
+# Gunshot direction tuning: keep detection permissive, then suppress spatial
+# bleed and rapid repeats at display time so distant shots are still visible.
 GUNSHOT_SPATIAL_MAX_DIRECTIONS = 2
 GUNSHOT_GLOBAL_COOLDOWN = 0.18
 
@@ -104,6 +109,8 @@ DIRECTION_EVENT_SECTORS = {
     "rear_left": 7,
     "rear_right": 5,
 }
+DIRECTION_EVENT_ORDER = tuple(DIRECTION_EVENT_SECTORS)
+DIRECTION_EVENT_ORDER_INDEX = {direction: index for index, direction in enumerate(DIRECTION_EVENT_ORDER)}
 DIRECTION_EVENT_PRIORITY = ("explosion", "gunshot", "vehicle", "footstep")
 CLASSIFIED_EVENT_KINDS = frozenset(DIRECTION_EVENT_PRIORITY)
 GUNSHOT_DIRECTION_NEIGHBORS = {
@@ -187,6 +194,21 @@ class WatercolorBlob:
     stretch: float = 1.0
     rotation_deg: float = 0.0
     flow_deg: float = 0.0
+
+
+@dataclass(frozen=True)
+class GunshotDisplayDecision:
+    candidate_scores: tuple
+    allowed_directions: frozenset
+    spatially_suppressed_directions: frozenset
+
+
+@dataclass(frozen=True)
+class DirectionEventPulseDebug:
+    gunshot_decision: GunshotDisplayDecision
+    gunshot_emitted_directions: tuple
+    gunshot_global_cooldown_blocked_directions: tuple
+    gunshot_sector_cooldown_blocked_directions: tuple
 
 
 def pulse_age_ratio(pulse, now):
@@ -362,19 +384,21 @@ def _direction_clusters(directions, neighbors):
     return clusters
 
 
-def spatially_allowed_gunshot_directions(
+def _sorted_direction_scores(scores_by_direction):
+    return tuple(
+        sorted(
+            scores_by_direction.items(),
+            key=lambda item: (-item[1], DIRECTION_EVENT_ORDER_INDEX.get(item[0], len(DIRECTION_EVENT_ORDER))),
+        )
+    )
+
+
+def gunshot_candidate_scores(
     scores_by_direction,
     active_by_direction,
     threshold=AST_DIRECTION_EVENT_THRESHOLD,
     event_thresholds=DIRECTION_EVENT_DISPLAY_THRESHOLDS,
-    max_directions=GUNSHOT_SPATIAL_MAX_DIRECTIONS,
 ):
-    """Return gunshot directions to display after suppressing adjacent bleed.
-
-    The threshold stays permissive for distant shots, but adjacent directions are
-    clustered and only the local maximum from each cluster is displayed.
-    """
-
     candidate_scores = {}
     for direction in DIRECTION_EVENT_SECTORS:
         score = _event_score_for_direction(
@@ -387,18 +411,72 @@ def spatially_allowed_gunshot_directions(
         )
         if score is not None:
             candidate_scores[direction] = score
+    return candidate_scores
 
+
+def gunshot_display_decision(
+    scores_by_direction,
+    active_by_direction,
+    threshold=AST_DIRECTION_EVENT_THRESHOLD,
+    event_thresholds=DIRECTION_EVENT_DISPLAY_THRESHOLDS,
+    max_directions=GUNSHOT_SPATIAL_MAX_DIRECTIONS,
+):
+    """Return gunshot display candidates and spatial suppression decisions.
+
+    The threshold stays permissive for distant shots, but adjacent directions are
+    clustered and only the local maximum from each cluster is displayed.
+    """
+
+    candidate_scores = gunshot_candidate_scores(
+        scores_by_direction,
+        active_by_direction,
+        threshold,
+        event_thresholds,
+    )
     if len(candidate_scores) <= 1:
-        return set(candidate_scores)
+        return GunshotDisplayDecision(
+            candidate_scores=_sorted_direction_scores(candidate_scores),
+            allowed_directions=frozenset(candidate_scores),
+            spatially_suppressed_directions=frozenset(),
+        )
 
     allowed = []
     for cluster in _direction_clusters(candidate_scores, GUNSHOT_DIRECTION_NEIGHBORS):
-        winner = max(cluster, key=lambda direction: candidate_scores[direction])
+        winner = max(
+            cluster,
+            key=lambda direction: (
+                candidate_scores[direction],
+                -DIRECTION_EVENT_ORDER_INDEX.get(direction, len(DIRECTION_EVENT_ORDER)),
+            ),
+        )
         winner_score = candidate_scores[winner]
         allowed.append((winner, winner_score))
 
-    allowed.sort(key=lambda item: item[1], reverse=True)
-    return {direction for direction, _ in allowed[: max(1, int(max_directions))]}
+    allowed.sort(key=lambda item: (-item[1], DIRECTION_EVENT_ORDER_INDEX.get(item[0], len(DIRECTION_EVENT_ORDER))))
+    allowed_directions = {direction for direction, _ in allowed[: max(1, int(max_directions))]}
+    return GunshotDisplayDecision(
+        candidate_scores=_sorted_direction_scores(candidate_scores),
+        allowed_directions=frozenset(allowed_directions),
+        spatially_suppressed_directions=frozenset(set(candidate_scores) - allowed_directions),
+    )
+
+
+def spatially_allowed_gunshot_directions(
+    scores_by_direction,
+    active_by_direction,
+    threshold=AST_DIRECTION_EVENT_THRESHOLD,
+    event_thresholds=DIRECTION_EVENT_DISPLAY_THRESHOLDS,
+    max_directions=GUNSHOT_SPATIAL_MAX_DIRECTIONS,
+):
+    return set(
+        gunshot_display_decision(
+            scores_by_direction,
+            active_by_direction,
+            threshold,
+            event_thresholds,
+            max_directions,
+        ).allowed_directions
+    )
 
 
 def suppress_displayed_events_for_direction(direction, events, allowed_gunshot_directions):
@@ -414,15 +492,20 @@ def create_pulses_from_direction_events(
     cooldown=AST_DIRECTION_EVENT_COOLDOWN,
     last_pulse_times=None,
     last_global_event_times=None,
+    display_debug=None,
 ):
     pulses = []
     scores_by_direction = getattr(prediction, "direction_event_scores", {}) or {}
     active_by_direction = getattr(prediction, "active_events_by_direction", {}) or {}
-    allowed_gunshot_directions = spatially_allowed_gunshot_directions(
+    gunshot_decision = gunshot_display_decision(
         scores_by_direction,
         active_by_direction,
         threshold,
     )
+    allowed_gunshot_directions = set(gunshot_decision.allowed_directions)
+    emitted_gunshot_directions = []
+    global_cooldown_blocked_gunshot_directions = []
+    sector_cooldown_blocked_gunshot_directions = []
 
     for direction, sector in DIRECTION_EVENT_SECTORS.items():
         scores = scores_by_direction.get(direction, {})
@@ -435,10 +518,13 @@ def create_pulses_from_direction_events(
             and any(event_name == "gunshot" for event_name, _ in events)
             and not should_emit_pulse(last_global_event_times.get("gunshot", -float("inf")), now, GUNSHOT_GLOBAL_COOLDOWN)
         ):
+            global_cooldown_blocked_gunshot_directions.append(direction)
             events = [(event_name, score) for event_name, score in events if event_name != "gunshot"]
             if not events:
                 continue
         if last_pulse_times is not None and not should_emit_pulse(last_pulse_times[sector], now, cooldown):
+            if any(event_name == "gunshot" for event_name, _ in events):
+                sector_cooldown_blocked_gunshot_directions.append(direction)
             continue
         lane_count = len(events)
         for lane_index, (event_name, score) in enumerate(events):
@@ -457,11 +543,49 @@ def create_pulses_from_direction_events(
             last_pulse_times[sector] = now
         if last_global_event_times is not None and any(event_name == "gunshot" for event_name, _ in events):
             last_global_event_times["gunshot"] = now
+        if any(event_name == "gunshot" for event_name, _ in events):
+            emitted_gunshot_directions.append(direction)
+    if display_debug is not None:
+        display_debug["debug"] = DirectionEventPulseDebug(
+            gunshot_decision=gunshot_decision,
+            gunshot_emitted_directions=tuple(emitted_gunshot_directions),
+            gunshot_global_cooldown_blocked_directions=tuple(global_cooldown_blocked_gunshot_directions),
+            gunshot_sector_cooldown_blocked_directions=tuple(sector_cooldown_blocked_gunshot_directions),
+        )
     return pulses
 
 
 def compact_score(score):
     return f"{clamp(float(score)):.2f}".lstrip("0")
+
+
+def _debug_direction_label(direction):
+    return DIRECTION_DEBUG_LABELS.get(direction, str(direction))
+
+
+def _format_debug_direction_list(directions):
+    ordered = sorted(directions or (), key=lambda direction: DIRECTION_EVENT_ORDER_INDEX.get(direction, len(DIRECTION_EVENT_ORDER)))
+    if not ordered:
+        return "--"
+    return "/".join(_debug_direction_label(direction) for direction in ordered)
+
+
+def _format_debug_direction_scores(direction_scores, max_items=7):
+    items = list(direction_scores or ())
+    if not items:
+        return "--"
+    return ",".join(f"{_debug_direction_label(direction)} {compact_score(score)}" for direction, score in items[: int(max_items)])
+
+
+def _format_gunshot_cooldown_debug(display_debug):
+    if display_debug is None:
+        return "--"
+    parts = []
+    if display_debug.gunshot_global_cooldown_blocked_directions:
+        parts.append(f"G:{_format_debug_direction_list(display_debug.gunshot_global_cooldown_blocked_directions)}")
+    if display_debug.gunshot_sector_cooldown_blocked_directions:
+        parts.append(f"S:{_format_debug_direction_list(display_debug.gunshot_sector_cooldown_blocked_directions)}")
+    return ",".join(parts) if parts else "--"
 
 
 def direction_event_device_label(runtime=None, requested_device=None, resolved_device=None, resolved_dtype=None):
@@ -518,6 +642,31 @@ def direction_event_debug_cell(direction, scores_by_direction, active_by_directi
     return f"{label}: {event_labels} {scores_label}"
 
 
+def direction_event_gunshot_debug_line(
+    prediction,
+    display_debug=None,
+    threshold=AST_DIRECTION_EVENT_THRESHOLD,
+):
+    if display_debug is not None:
+        decision = display_debug.gunshot_decision
+        shown_directions = display_debug.gunshot_emitted_directions
+    elif prediction is not None:
+        scores_by_direction = getattr(prediction, "direction_event_scores", {}) or {}
+        active_by_direction = getattr(prediction, "active_events_by_direction", {}) or {}
+        decision = gunshot_display_decision(scores_by_direction, active_by_direction, threshold)
+        shown_directions = tuple(decision.allowed_directions)
+    else:
+        decision = GunshotDisplayDecision(tuple(), frozenset(), frozenset())
+        shown_directions = tuple()
+
+    return (
+        f"gun cand {_format_debug_direction_scores(decision.candidate_scores)} "
+        f"show {_format_debug_direction_list(shown_directions)} "
+        f"sup {_format_debug_direction_list(decision.spatially_suppressed_directions)} "
+        f"cd {_format_gunshot_cooldown_debug(display_debug)}"
+    )
+
+
 def direction_event_debug_lines(
     prediction,
     threshold=AST_DIRECTION_EVENT_THRESHOLD,
@@ -529,23 +678,31 @@ def direction_event_debug_lines(
     teacher_model=None,
     radar_latency_ms=None,
     ast_latency_ms=None,
+    display_debug=None,
 ):
-    _ = max_lines
     header = direction_event_debug_header(status, requested_device, resolved_device, resolved_dtype, teacher_model)
     if prediction is None:
-        return [header, direction_latency_debug_line(radar_latency_ms, ast_latency_ms), "waiting for audio/model..."]
+        lines = [
+            header,
+            direction_latency_debug_line(radar_latency_ms, ast_latency_ms),
+            direction_event_gunshot_debug_line(None, display_debug, threshold),
+            "waiting for audio/model...",
+        ]
+        return lines[: int(max_lines)] if max_lines else lines
 
     scores_by_direction = getattr(prediction, "direction_event_scores", {}) or {}
     active_by_direction = getattr(prediction, "active_events_by_direction", {}) or {}
     cell = lambda direction: direction_event_debug_cell(direction, scores_by_direction, active_by_direction, threshold)
-    return [
+    lines = [
         header,
         direction_latency_debug_line(radar_latency_ms, ast_latency_ms),
+        direction_event_gunshot_debug_line(prediction, display_debug, threshold),
         f"        {cell('front')}",
         f"{cell('front_left')}    {cell('front_right')}",
         f"{cell('left')}    {cell('right')}",
         f"{cell('rear_left')}    {cell('rear_right')}",
     ]
+    return lines[: int(max_lines)] if max_lines else lines
 
 
 def normalize_degrees(angle):
@@ -1248,6 +1405,7 @@ class RippleOverlayWidget(QtWidgets.QWidget):
             teacher_model=teacher_model,
             radar_latency_ms=getattr(parent, "radar_latency_ms", None),
             ast_latency_ms=getattr(parent, "ast_latency_ms", None),
+            display_debug=getattr(parent, "latest_direction_event_display_debug", None),
         )
 
     def _paint_event_debug_text(self, painter, parent, min_side):
@@ -1324,6 +1482,7 @@ class ParentWidget(QtWidgets.QWidget):
         self._previous_direction_levels = np.zeros(RADAR_SECTORS)
         self.direction_event_runtime = None
         self.latest_direction_event_prediction = None
+        self.latest_direction_event_display_debug = None
         self.radar_latency_ms = None
         self.ast_latency_ms = None
         self._create_sectors()
@@ -1792,6 +1951,7 @@ def updateRadar(radarObject):
                 previous_levels=radarObject._previous_direction_levels,
             )
             radarObject.add_pulses(new_pulses)
+            event_display_debug = {}
             event_pulses = (
                 create_pulses_from_direction_events(
                     event_prediction,
@@ -1800,10 +1960,13 @@ def updateRadar(radarObject):
                     cooldown=AST_DIRECTION_EVENT_COOLDOWN,
                     last_pulse_times=radarObject._last_event_pulse_times,
                     last_global_event_times=radarObject._last_global_event_times,
+                    display_debug=event_display_debug,
                 )
                 if event_prediction is not None
                 else []
             )
+            if event_prediction is not None:
+                radarObject.latest_direction_event_display_debug = event_display_debug.get("debug")
             radarObject.add_pulses(event_pulses)
             radarObject.prune_pulses(now)
             radarObject._previous_direction_levels = np.array(direction_levels, copy=True)
