@@ -476,6 +476,121 @@ class SoundRadarPulseTests(unittest.TestCase):
         self.assertAlmostEqual(pulses[0].strength, 0.8)
         self.assertEqual(pulses[0].duration, soundRadar.EVENT_ICON_DURATION)
 
+    def test_direction_event_prediction_suppresses_adjacent_gunshot_bleed(self):
+        prediction = SimpleNamespace(
+            direction_event_scores={
+                "front": {
+                    "background": 0.2,
+                    "footstep": 0.0,
+                    "gunshot": 0.31,
+                    "vehicle": 0.0,
+                    "explosion": 0.0,
+                },
+                "front_right": {
+                    "background": 0.1,
+                    "footstep": 0.0,
+                    "gunshot": 0.72,
+                    "vehicle": 0.0,
+                    "explosion": 0.0,
+                },
+                "right": {
+                    "background": 0.3,
+                    "footstep": 0.0,
+                    "gunshot": 0.26,
+                    "vehicle": 0.0,
+                    "explosion": 0.0,
+                },
+            },
+            active_events_by_direction={
+                "front": ["gunshot"],
+                "front_right": ["gunshot"],
+                "right": ["gunshot"],
+            },
+        )
+
+        pulses = soundRadar.create_pulses_from_direction_events(prediction, now=10.0, threshold=0.1)
+
+        self.assertEqual(len(pulses), 1)
+        self.assertEqual(pulses[0].sector, soundRadar.DIRECTION_EVENT_SECTORS["front_right"])
+        self.assertEqual(pulses[0].kind, "gunshot")
+        self.assertAlmostEqual(pulses[0].strength, 0.72)
+
+    def test_direction_event_prediction_keeps_distant_low_score_gunshot_local_maximum(self):
+        prediction = SimpleNamespace(
+            direction_event_scores={
+                "front": {
+                    "background": 0.9,
+                    "footstep": 0.0,
+                    "gunshot": 0.10,
+                    "vehicle": 0.0,
+                    "explosion": 0.0,
+                },
+                "front_right": {
+                    "background": 0.85,
+                    "footstep": 0.0,
+                    "gunshot": 0.13,
+                    "vehicle": 0.0,
+                    "explosion": 0.0,
+                },
+                "right": {
+                    "background": 0.9,
+                    "footstep": 0.0,
+                    "gunshot": 0.11,
+                    "vehicle": 0.0,
+                    "explosion": 0.0,
+                },
+            },
+            active_events_by_direction={
+                "front": ["gunshot"],
+                "front_right": ["gunshot"],
+                "right": ["gunshot"],
+            },
+        )
+
+        pulses = soundRadar.create_pulses_from_direction_events(prediction, now=10.0, threshold=0.1)
+
+        self.assertEqual(len(pulses), 1)
+        self.assertEqual(pulses[0].sector, soundRadar.DIRECTION_EVENT_SECTORS["front_right"])
+        self.assertAlmostEqual(pulses[0].strength, 0.13)
+
+    def test_direction_event_prediction_applies_global_gunshot_cooldown(self):
+        prediction = SimpleNamespace(
+            direction_event_scores={
+                "right": {
+                    "background": 0.2,
+                    "footstep": 0.0,
+                    "gunshot": 0.8,
+                    "vehicle": 0.0,
+                    "explosion": 0.0,
+                }
+            },
+            active_events_by_direction={"right": ["gunshot"]},
+        )
+        last_global_event_times = {}
+
+        first = soundRadar.create_pulses_from_direction_events(
+            prediction,
+            now=10.0,
+            threshold=0.1,
+            last_global_event_times=last_global_event_times,
+        )
+        blocked = soundRadar.create_pulses_from_direction_events(
+            prediction,
+            now=10.05,
+            threshold=0.1,
+            last_global_event_times=last_global_event_times,
+        )
+        allowed = soundRadar.create_pulses_from_direction_events(
+            prediction,
+            now=10.25,
+            threshold=0.1,
+            last_global_event_times=last_global_event_times,
+        )
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(blocked, [])
+        self.assertEqual(len(allowed), 1)
+
     def test_direction_event_prediction_creates_multiple_event_icons_per_sector(self):
         prediction = SimpleNamespace(
             direction_event_scores={

@@ -92,6 +92,8 @@ DIRECTION_EVENT_SECONDARY_DISPLAY_THRESHOLDS = {
 }
 DIRECTION_EVENT_GUNSHOT_BIAS_MARGIN = 0.25
 DIRECTION_EVENT_MAX_ICONS_PER_DIRECTION = 2
+GUNSHOT_SPATIAL_MAX_DIRECTIONS = 2
+GUNSHOT_GLOBAL_COOLDOWN = 0.18
 
 DIRECTION_EVENT_SECTORS = {
     "front_left": 11,
@@ -104,6 +106,15 @@ DIRECTION_EVENT_SECTORS = {
 }
 DIRECTION_EVENT_PRIORITY = ("explosion", "gunshot", "vehicle", "footstep")
 CLASSIFIED_EVENT_KINDS = frozenset(DIRECTION_EVENT_PRIORITY)
+GUNSHOT_DIRECTION_NEIGHBORS = {
+    "front_left": frozenset(("front", "left")),
+    "front": frozenset(("front_left", "front_right")),
+    "front_right": frozenset(("front", "right")),
+    "left": frozenset(("front_left", "rear_left")),
+    "right": frozenset(("front_right", "rear_right")),
+    "rear_left": frozenset(("left", "rear_right")),
+    "rear_right": frozenset(("right", "rear_left")),
+}
 EVENT_ICON_DURATION = 3.5
 EVENT_ICON_HOLD_AGE_RATIO = 0.68
 EVENT_ICON_DISTANCE_RATIO = 0.40
@@ -318,22 +329,115 @@ def displayed_active_events(
     return ordered[: int(max_events)]
 
 
+def _direction_event_is_active(event_name, active_events):
+    active = set(active_events or ())
+    return not active or event_name in active
+
+
+def _event_score_for_direction(scores_by_direction, active_by_direction, direction, event_name, threshold, event_thresholds):
+    scores = scores_by_direction.get(direction, {}) or {}
+    score = clamp(float(scores.get(event_name, 0.0)))
+    if score < event_display_threshold(event_name, threshold, event_thresholds):
+        return None
+    if not _direction_event_is_active(event_name, active_by_direction.get(direction, ())):
+        return None
+    return score
+
+
+def _direction_clusters(directions, neighbors):
+    remaining = set(directions)
+    clusters = []
+    while remaining:
+        start = remaining.pop()
+        cluster = {start}
+        stack = [start]
+        while stack:
+            direction = stack.pop()
+            for neighbor in neighbors.get(direction, ()):
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    cluster.add(neighbor)
+                    stack.append(neighbor)
+        clusters.append(cluster)
+    return clusters
+
+
+def spatially_allowed_gunshot_directions(
+    scores_by_direction,
+    active_by_direction,
+    threshold=AST_DIRECTION_EVENT_THRESHOLD,
+    event_thresholds=DIRECTION_EVENT_DISPLAY_THRESHOLDS,
+    max_directions=GUNSHOT_SPATIAL_MAX_DIRECTIONS,
+):
+    """Return gunshot directions to display after suppressing adjacent bleed.
+
+    The threshold stays permissive for distant shots, but adjacent directions are
+    clustered and only the local maximum from each cluster is displayed.
+    """
+
+    candidate_scores = {}
+    for direction in DIRECTION_EVENT_SECTORS:
+        score = _event_score_for_direction(
+            scores_by_direction,
+            active_by_direction,
+            direction,
+            "gunshot",
+            threshold,
+            event_thresholds,
+        )
+        if score is not None:
+            candidate_scores[direction] = score
+
+    if len(candidate_scores) <= 1:
+        return set(candidate_scores)
+
+    allowed = []
+    for cluster in _direction_clusters(candidate_scores, GUNSHOT_DIRECTION_NEIGHBORS):
+        winner = max(cluster, key=lambda direction: candidate_scores[direction])
+        winner_score = candidate_scores[winner]
+        allowed.append((winner, winner_score))
+
+    allowed.sort(key=lambda item: item[1], reverse=True)
+    return {direction for direction, _ in allowed[: max(1, int(max_directions))]}
+
+
+def suppress_displayed_events_for_direction(direction, events, allowed_gunshot_directions):
+    if direction in allowed_gunshot_directions:
+        return events
+    return [(event_name, score) for event_name, score in events if event_name != "gunshot"]
+
+
 def create_pulses_from_direction_events(
     prediction,
     now,
     threshold=AST_DIRECTION_EVENT_THRESHOLD,
     cooldown=AST_DIRECTION_EVENT_COOLDOWN,
     last_pulse_times=None,
+    last_global_event_times=None,
 ):
     pulses = []
     scores_by_direction = getattr(prediction, "direction_event_scores", {}) or {}
     active_by_direction = getattr(prediction, "active_events_by_direction", {}) or {}
+    allowed_gunshot_directions = spatially_allowed_gunshot_directions(
+        scores_by_direction,
+        active_by_direction,
+        threshold,
+    )
 
     for direction, sector in DIRECTION_EVENT_SECTORS.items():
         scores = scores_by_direction.get(direction, {})
         events = displayed_active_events(scores, active_by_direction.get(direction, ()), threshold)
+        events = suppress_displayed_events_for_direction(direction, events, allowed_gunshot_directions)
         if not events:
             continue
+        if (
+            last_global_event_times is not None
+            and any(event_name == "gunshot" for event_name, _ in events)
+            and not should_emit_pulse(last_global_event_times.get("gunshot", -float("inf")), now, GUNSHOT_GLOBAL_COOLDOWN)
+        ):
+            events = [(event_name, score) for event_name, score in events if event_name != "gunshot"]
+            if not events:
+                continue
         if last_pulse_times is not None and not should_emit_pulse(last_pulse_times[sector], now, cooldown):
             continue
         lane_count = len(events)
@@ -351,6 +455,8 @@ def create_pulses_from_direction_events(
             )
         if last_pulse_times is not None:
             last_pulse_times[sector] = now
+        if last_global_event_times is not None and any(event_name == "gunshot" for event_name, _ in events):
+            last_global_event_times["gunshot"] = now
     return pulses
 
 
@@ -1214,6 +1320,7 @@ class ParentWidget(QtWidgets.QWidget):
         self.pulses = []
         self._last_pulse_times = np.zeros(RADAR_SECTORS)
         self._last_event_pulse_times = np.zeros(RADAR_SECTORS)
+        self._last_global_event_times = {}
         self._previous_direction_levels = np.zeros(RADAR_SECTORS)
         self.direction_event_runtime = None
         self.latest_direction_event_prediction = None
@@ -1692,6 +1799,7 @@ def updateRadar(radarObject):
                     threshold=AST_DIRECTION_EVENT_THRESHOLD,
                     cooldown=AST_DIRECTION_EVENT_COOLDOWN,
                     last_pulse_times=radarObject._last_event_pulse_times,
+                    last_global_event_times=radarObject._last_global_event_times,
                 )
                 if event_prediction is not None
                 else []
