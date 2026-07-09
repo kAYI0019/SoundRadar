@@ -105,7 +105,11 @@ through the direction-event teacher:
 The capture GUI lets you pick the input device, duration, channel count, and WAV
 output path. After recording, click **Analyze** to run the direction-event
 teacher and show the HUD-style `gun cand/show/sup/cd` summary plus direction
-scores in the GUI log. The same capture path is available as a CLI:
+scores in the GUI log. Analysis also writes a `*.analysis.json` file next to the
+WAV with the peak summary, teacher settings, HUD lines, direction scores, and
+gunshot display decisions. Use the **Tag** row to append the current sample to a
+CSV library as `gunshot`, `vehicle`, `footstep`, `unknown`, or `bad sample`.
+The same capture path is available as a CLI:
 
 ```sh
 .venv/bin/python -m sound_model.capture_direction_sample --device "BlackHole 16ch" --seconds 20 --out /tmp/pubg-sample.wav
@@ -121,6 +125,17 @@ Run the application:
 ```sh
 .venv/bin/python -u soundRadar.py
 ```
+
+Threshold/cooldown tuning can be selected without editing code:
+
+```sh
+.venv/bin/python -u soundRadar.py --threshold-profile quiet
+SOUNDRADAR_THRESHOLD_PROFILE=aggressive .venv/bin/python -u soundRadar.py
+```
+
+Available profiles are `default`, `quiet`, `aggressive`, and `debug`. `quiet`
+raises thresholds and lengthens cooldowns to reduce visual spam, while
+`aggressive` and `debug` make detection/display more permissive for tuning.
 
 ### Optional Hugging Face AST model
 

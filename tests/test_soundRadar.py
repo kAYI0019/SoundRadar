@@ -843,6 +843,41 @@ class SoundRadarPulseTests(unittest.TestCase):
         self.assertLess(later_opacity, start_opacity)
 
 
+class SoundRadarThresholdProfileTests(unittest.TestCase):
+    def tearDown(self):
+        soundRadar.apply_threshold_profile("default")
+
+    def test_threshold_profile_names_include_runtime_choices(self):
+        self.assertEqual(soundRadar.threshold_profile_names(), ("default", "quiet", "aggressive", "debug"))
+
+    def test_parse_threshold_profile_args_uses_env_and_removes_qt_arg(self):
+        qt_args, profile_name = soundRadar.parse_threshold_profile_args(
+            ["soundRadar.py", "--threshold-profile", "quiet", "-platform", "offscreen"],
+            environ={soundRadar.THRESHOLD_PROFILE_ENV: "aggressive"},
+        )
+
+        self.assertEqual(qt_args, ["soundRadar.py", "-platform", "offscreen"])
+        self.assertEqual(profile_name, "quiet")
+
+    def test_parse_threshold_profile_args_accepts_equals_form(self):
+        qt_args, profile_name = soundRadar.parse_threshold_profile_args(
+            ["soundRadar.py", "--threshold-profile=debug"],
+            environ={},
+        )
+
+        self.assertEqual(qt_args, ["soundRadar.py"])
+        self.assertEqual(profile_name, "debug")
+
+    def test_apply_threshold_profile_updates_thresholds_without_code_edits(self):
+        profile = soundRadar.apply_threshold_profile("quiet")
+
+        self.assertEqual(profile.name, "quiet")
+        self.assertEqual(soundRadar.RIPPLE_THRESHOLD, profile.ripple_threshold)
+        self.assertEqual(soundRadar.AST_DIRECTION_EVENT_THRESHOLD, profile.direction_event_threshold)
+        self.assertEqual(soundRadar.DIRECTION_EVENT_DISPLAY_THRESHOLDS["gunshot"], 0.16)
+        self.assertEqual(soundRadar.GUNSHOT_SPATIAL_MAX_DIRECTIONS, 1)
+
+
 class SoundRadarWindowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

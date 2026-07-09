@@ -3,6 +3,7 @@ import ctypes
 import ctypes.util
 from dataclasses import dataclass
 import math
+import os
 import queue
 import random
 import sys
@@ -99,6 +100,146 @@ DIRECTION_EVENT_MAX_ICONS_PER_DIRECTION = 2
 # bleed and rapid repeats at display time so distant shots are still visible.
 GUNSHOT_SPATIAL_MAX_DIRECTIONS = 2
 GUNSHOT_GLOBAL_COOLDOWN = 0.18
+
+THRESHOLD_PROFILE_ENV = "SOUNDRADAR_THRESHOLD_PROFILE"
+
+
+@dataclass(frozen=True)
+class ThresholdProfile:
+    name: str
+    ripple_threshold: float
+    ripple_cooldown: float
+    direction_event_threshold: float
+    direction_event_cooldown: float
+    gunshot_global_cooldown: float
+    gunshot_spatial_max_directions: int
+    direction_event_display_thresholds: dict
+    direction_event_secondary_thresholds: dict
+    show_event_debug_text: bool
+
+
+def _threshold_dict(**overrides):
+    values = dict(DIRECTION_EVENT_DISPLAY_THRESHOLDS)
+    values.update(overrides)
+    return values
+
+
+def _secondary_threshold_dict(**overrides):
+    values = dict(DIRECTION_EVENT_SECONDARY_DISPLAY_THRESHOLDS)
+    values.update(overrides)
+    return values
+
+
+THRESHOLD_PROFILES = {
+    "default": ThresholdProfile(
+        name="default",
+        ripple_threshold=RIPPLE_THRESHOLD,
+        ripple_cooldown=RIPPLE_COOLDOWN,
+        direction_event_threshold=AST_DIRECTION_EVENT_THRESHOLD,
+        direction_event_cooldown=AST_DIRECTION_EVENT_COOLDOWN,
+        gunshot_global_cooldown=GUNSHOT_GLOBAL_COOLDOWN,
+        gunshot_spatial_max_directions=GUNSHOT_SPATIAL_MAX_DIRECTIONS,
+        direction_event_display_thresholds=dict(DIRECTION_EVENT_DISPLAY_THRESHOLDS),
+        direction_event_secondary_thresholds=dict(DIRECTION_EVENT_SECONDARY_DISPLAY_THRESHOLDS),
+        show_event_debug_text=SHOW_EVENT_DEBUG_TEXT,
+    ),
+    "quiet": ThresholdProfile(
+        name="quiet",
+        ripple_threshold=0.045,
+        ripple_cooldown=0.26,
+        direction_event_threshold=0.16,
+        direction_event_cooldown=0.75,
+        gunshot_global_cooldown=0.30,
+        gunshot_spatial_max_directions=1,
+        direction_event_display_thresholds=_threshold_dict(gunshot=0.16, explosion=0.90, vehicle=0.70, footstep=0.90),
+        direction_event_secondary_thresholds=_secondary_threshold_dict(gunshot=0.48, explosion=0.90, vehicle=0.70, footstep=0.90),
+        show_event_debug_text=SHOW_EVENT_DEBUG_TEXT,
+    ),
+    "aggressive": ThresholdProfile(
+        name="aggressive",
+        ripple_threshold=0.020,
+        ripple_cooldown=0.12,
+        direction_event_threshold=0.07,
+        direction_event_cooldown=0.38,
+        gunshot_global_cooldown=0.12,
+        gunshot_spatial_max_directions=2,
+        direction_event_display_thresholds=_threshold_dict(gunshot=0.07, explosion=0.72, vehicle=0.48, footstep=0.72),
+        direction_event_secondary_thresholds=_secondary_threshold_dict(gunshot=0.25, explosion=0.72, vehicle=0.48, footstep=0.72),
+        show_event_debug_text=SHOW_EVENT_DEBUG_TEXT,
+    ),
+    "debug": ThresholdProfile(
+        name="debug",
+        ripple_threshold=0.015,
+        ripple_cooldown=0.08,
+        direction_event_threshold=0.05,
+        direction_event_cooldown=0.20,
+        gunshot_global_cooldown=0.05,
+        gunshot_spatial_max_directions=3,
+        direction_event_display_thresholds=_threshold_dict(gunshot=0.05, explosion=0.55, vehicle=0.35, footstep=0.55),
+        direction_event_secondary_thresholds=_secondary_threshold_dict(gunshot=0.18, explosion=0.55, vehicle=0.35, footstep=0.55),
+        show_event_debug_text=True,
+    ),
+}
+
+
+def threshold_profile_names():
+    return tuple(THRESHOLD_PROFILES)
+
+
+def threshold_profile(name=None):
+    profile_name = (name or "default").strip().lower()
+    try:
+        return THRESHOLD_PROFILES[profile_name]
+    except KeyError as exc:
+        choices = ", ".join(threshold_profile_names())
+        raise ValueError(f"unknown threshold profile: {name}; choose one of: {choices}") from exc
+
+
+def parse_threshold_profile_args(argv, environ=None):
+    environ = os.environ if environ is None else environ
+    profile_name = environ.get(THRESHOLD_PROFILE_ENV, "default")
+    cleaned = []
+    args = list(argv)
+    index = 0
+    while index < len(args):
+        value = args[index]
+        if value == "--threshold-profile":
+            if index + 1 >= len(args):
+                raise ValueError("--threshold-profile requires a value")
+            profile_name = args[index + 1]
+            index += 2
+            continue
+        if value.startswith("--threshold-profile="):
+            profile_name = value.split("=", 1)[1]
+            index += 1
+            continue
+        cleaned.append(value)
+        index += 1
+    return cleaned, threshold_profile(profile_name).name
+
+
+def apply_threshold_profile(name=None):
+    global RIPPLE_THRESHOLD, RIPPLE_COOLDOWN
+    global AST_DIRECTION_EVENT_THRESHOLD, AST_DIRECTION_EVENT_COOLDOWN
+    global DIRECTION_EVENT_GUNSHOT_DISPLAY_THRESHOLD, DIRECTION_EVENT_GUNSHOT_SECONDARY_THRESHOLD
+    global GUNSHOT_GLOBAL_COOLDOWN, GUNSHOT_SPATIAL_MAX_DIRECTIONS, SHOW_EVENT_DEBUG_TEXT
+
+    profile = threshold_profile(name)
+    RIPPLE_THRESHOLD = profile.ripple_threshold
+    RIPPLE_COOLDOWN = profile.ripple_cooldown
+    AST_DIRECTION_EVENT_THRESHOLD = profile.direction_event_threshold
+    AST_DIRECTION_EVENT_COOLDOWN = profile.direction_event_cooldown
+    GUNSHOT_GLOBAL_COOLDOWN = profile.gunshot_global_cooldown
+    GUNSHOT_SPATIAL_MAX_DIRECTIONS = profile.gunshot_spatial_max_directions
+    DIRECTION_EVENT_DISPLAY_THRESHOLDS.clear()
+    DIRECTION_EVENT_DISPLAY_THRESHOLDS.update(profile.direction_event_display_thresholds)
+    DIRECTION_EVENT_SECONDARY_DISPLAY_THRESHOLDS.clear()
+    DIRECTION_EVENT_SECONDARY_DISPLAY_THRESHOLDS.update(profile.direction_event_secondary_thresholds)
+    DIRECTION_EVENT_GUNSHOT_DISPLAY_THRESHOLD = DIRECTION_EVENT_DISPLAY_THRESHOLDS["gunshot"]
+    DIRECTION_EVENT_GUNSHOT_SECONDARY_THRESHOLD = DIRECTION_EVENT_SECONDARY_DISPLAY_THRESHOLDS["gunshot"]
+    SHOW_EVENT_DEBUG_TEXT = profile.show_event_debug_text
+    return profile
+
 
 DIRECTION_EVENT_SECTORS = {
     "front_left": 11,
@@ -2095,13 +2236,17 @@ def configure_direction_event_runtime(window, sample_rate, channel_count, channe
 mapping, channel_mode = build_channel_mapping(n_chans)
 
 
-def main():
-    app = QtWidgets.QApplication(sys.argv)
+def main(argv=None):
+    argv = list(sys.argv if argv is None else argv)
+    qt_argv, threshold_profile_name = parse_threshold_profile_args(argv)
+    active_profile = apply_threshold_profile(threshold_profile_name)
+    app = QtWidgets.QApplication(qt_argv)
     window = create_main_window()
     device_id, device_info = select_input_device()
     assert device_info is not None
     configure_audio_mapping(device_info)
     configure_direction_event_runtime(window, device_info.get("default_samplerate", 44_100), n_chans, mapping)
+    print(f"Threshold profile: {active_profile.name}")
     print("Make sure system Sound Output is set to BlackHole/Loopback/VB-Cable or a Multi-Output device that includes it.")
 
     stream = sd.InputStream(

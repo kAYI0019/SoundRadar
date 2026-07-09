@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import csv
 from datetime import datetime
+import json
 from pathlib import Path
 import shlex
 import sys
 
 from PyQt5 import QtCore, QtWidgets
 
-from .audio_features import write_wav
+from .audio_features import read_wav, write_wav
 from .capture_direction_sample import (
     channel_peak_summary,
     choose_recording_channels,
@@ -37,6 +39,15 @@ EVENT_LABELS = {
     "footstep": "FOOT",
     "explosion": "EXP",
 }
+SAMPLE_TAGS = ("gunshot", "vehicle", "footstep", "unknown", "bad sample")
+LIBRARY_FIELDS = (
+    "created_at",
+    "audio_path",
+    "tag",
+    "notes",
+    "analysis_path",
+    "peak_summary",
+)
 
 
 def default_capture_path(now=None, directory: str | Path = "/tmp") -> Path:
@@ -67,6 +78,24 @@ def direction_events_command(path: str | Path, *, teacher_model: str = "ast", de
             str(top_k),
         )
     )
+
+
+def analysis_result_path(audio_path: str | Path) -> Path:
+    return Path(audio_path).with_suffix(".analysis.json")
+
+
+def default_library_path(directory: str | Path | None = None) -> Path:
+    base = Path(directory) if directory is not None else Path.home() / "SoundRadarSamples"
+    return base / "sample_library.csv"
+
+
+def available_threshold_profiles() -> tuple[str, ...]:
+    try:
+        import soundRadar
+
+        return soundRadar.threshold_profile_names()
+    except Exception:
+        return ("default",)
 
 
 def compact_score(score) -> str:
@@ -102,9 +131,10 @@ def direction_score_summary_lines(prediction) -> list[str]:
     return lines
 
 
-def hud_summary_lines(prediction) -> list[str]:
+def _display_debug_for_prediction(prediction, *, threshold_profile: str = "default"):
     import soundRadar
 
+    soundRadar.apply_threshold_profile(threshold_profile)
     display_debug = {}
     soundRadar.create_pulses_from_direction_events(
         prediction,
@@ -112,19 +142,159 @@ def hud_summary_lines(prediction) -> list[str]:
         threshold=soundRadar.AST_DIRECTION_EVENT_THRESHOLD,
         display_debug=display_debug,
     )
+    return display_debug.get("debug")
+
+
+def hud_summary_lines(prediction, *, display_debug=None, threshold_profile: str = "default") -> list[str]:
+    import soundRadar
+
+    soundRadar.apply_threshold_profile(threshold_profile)
+    display_debug = (
+        _display_debug_for_prediction(prediction, threshold_profile=threshold_profile)
+        if display_debug is None
+        else display_debug
+    )
     return soundRadar.direction_event_debug_lines(
         prediction,
         threshold=soundRadar.AST_DIRECTION_EVENT_THRESHOLD,
-        display_debug=display_debug.get("debug"),
+        display_debug=display_debug,
     )
 
 
-def prediction_summary_text(prediction) -> str:
+def prediction_summary_text(prediction, *, threshold_profile: str = "default") -> str:
     lines = ["HUD summary:"]
-    lines.extend(hud_summary_lines(prediction))
+    lines.extend(hud_summary_lines(prediction, threshold_profile=threshold_profile))
     lines.append("")
     lines.extend(direction_score_summary_lines(prediction))
     return "\n".join(lines)
+
+
+def _prediction_scores_payload(prediction) -> dict[str, object]:
+    scores_by_direction = getattr(prediction, "direction_event_scores", {}) or {}
+    active_by_direction = getattr(prediction, "active_events_by_direction", {}) or {}
+    top_labels_by_direction = getattr(prediction, "top_labels_by_direction", {}) or {}
+    payload = {}
+    for direction in DIRECTION_NAMES:
+        scores = scores_by_direction.get(direction, {}) or {}
+        payload[direction] = {
+            "scores": {event_name: float(scores.get(event_name, 0.0)) for event_name in EVENT_SCORE_ORDER},
+            "active_events": list(active_by_direction.get(direction, ())),
+            "top_labels": [
+                {
+                    "label": str(item.get("label", "")),
+                    "score": float(item.get("score", 0.0)),
+                }
+                for item in top_labels_by_direction.get(direction, ())
+                if isinstance(item, dict)
+            ],
+        }
+    return payload
+
+
+def _gunshot_debug_payload(display_debug) -> dict[str, object]:
+    if display_debug is None:
+        return {
+            "candidate_scores": [],
+            "shown_directions": [],
+            "spatially_suppressed_directions": [],
+            "global_cooldown_blocked_directions": [],
+            "sector_cooldown_blocked_directions": [],
+        }
+    decision = display_debug.gunshot_decision
+    return {
+        "candidate_scores": [
+            {"direction": str(direction), "score": float(score)}
+            for direction, score in decision.candidate_scores
+        ],
+        "shown_directions": list(display_debug.gunshot_emitted_directions),
+        "spatially_suppressed_directions": sorted(decision.spatially_suppressed_directions),
+        "global_cooldown_blocked_directions": list(display_debug.gunshot_global_cooldown_blocked_directions),
+        "sector_cooldown_blocked_directions": list(display_debug.gunshot_sector_cooldown_blocked_directions),
+    }
+
+
+def peak_summary_for_file(audio_path: str | Path) -> str | None:
+    try:
+        audio, _ = read_wav(audio_path)
+    except Exception:
+        return None
+    return channel_peak_summary(audio)
+
+
+def prediction_result_payload(
+    prediction,
+    *,
+    audio_path: str | Path,
+    teacher_model: str,
+    device: str,
+    top_k: int,
+    peak_summary: str | None = None,
+    threshold_profile: str = "default",
+    analyzed_at: datetime | None = None,
+) -> dict[str, object]:
+    analyzed_at = analyzed_at or datetime.now()
+    display_debug = _display_debug_for_prediction(prediction, threshold_profile=threshold_profile)
+    hud_lines = hud_summary_lines(prediction, display_debug=display_debug, threshold_profile=threshold_profile)
+    return {
+        "schema_version": 1,
+        "analyzed_at": analyzed_at.isoformat(timespec="seconds"),
+        "audio_path": str(Path(audio_path)),
+        "peak_summary": peak_summary,
+        "teacher_model": str(teacher_model),
+        "device": str(device),
+        "top_k": int(top_k),
+        "threshold_profile": str(threshold_profile),
+        "prediction": prediction.to_jsonable() if hasattr(prediction, "to_jsonable") else None,
+        "hud_summary_lines": hud_lines,
+        "direction_scores": _prediction_scores_payload(prediction),
+        "gunshot_display": _gunshot_debug_payload(display_debug),
+    }
+
+
+def write_prediction_result_json(
+    audio_path: str | Path,
+    payload: dict[str, object],
+    *,
+    result_path: str | Path | None = None,
+) -> Path:
+    path = Path(result_path) if result_path is not None else analysis_result_path(audio_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+
+def sample_library_record(
+    *,
+    audio_path: str | Path,
+    tag: str,
+    notes: str = "",
+    analysis_path: str | Path | None = None,
+    peak_summary: str | None = None,
+    created_at: datetime | None = None,
+) -> dict[str, str]:
+    if tag not in SAMPLE_TAGS:
+        raise ValueError(f"unknown sample tag: {tag}")
+    created_at = created_at or datetime.now()
+    return {
+        "created_at": created_at.isoformat(timespec="seconds"),
+        "audio_path": str(Path(audio_path)),
+        "tag": tag,
+        "notes": str(notes),
+        "analysis_path": "" if analysis_path is None else str(Path(analysis_path)),
+        "peak_summary": "" if peak_summary is None else str(peak_summary),
+    }
+
+
+def append_sample_library_record(library_path: str | Path, record: dict[str, str]) -> Path:
+    path = Path(library_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=LIBRARY_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({field: record.get(field, "") for field in LIBRARY_FIELDS})
+    return path
 
 
 def _plain_device_info(device_info):
@@ -169,15 +339,26 @@ class CaptureWorker(QtCore.QObject):
 
 
 class AnalysisWorker(QtCore.QObject):
-    finished = QtCore.pyqtSignal(str, str)
+    finished = QtCore.pyqtSignal(str, str, str)
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, *, audio_path: Path, teacher_model: str, device: str, top_k: int):
+    def __init__(
+        self,
+        *,
+        audio_path: Path,
+        teacher_model: str,
+        device: str,
+        top_k: int,
+        peak_summary: str | None = None,
+        threshold_profile: str = "default",
+    ):
         super().__init__()
         self.audio_path = Path(audio_path)
         self.teacher_model = str(teacher_model)
         self.device = str(device)
         self.top_k = int(top_k)
+        self.peak_summary = peak_summary
+        self.threshold_profile = str(threshold_profile)
 
     @QtCore.pyqtSlot()
     def run(self):
@@ -190,7 +371,24 @@ class AnalysisWorker(QtCore.QObject):
                 device=self.device,
                 top_k=self.top_k,
             )
-            self.finished.emit(str(self.audio_path), prediction_summary_text(prediction))
+            peak_summary = self.peak_summary if self.peak_summary is not None else peak_summary_for_file(self.audio_path)
+            result_path = write_prediction_result_json(
+                self.audio_path,
+                prediction_result_payload(
+                    prediction,
+                    audio_path=self.audio_path,
+                    teacher_model=self.teacher_model,
+                    device=self.device,
+                    top_k=self.top_k,
+                    peak_summary=peak_summary,
+                    threshold_profile=self.threshold_profile,
+                ),
+            )
+            self.finished.emit(
+                str(self.audio_path),
+                prediction_summary_text(prediction, threshold_profile=self.threshold_profile),
+                str(result_path),
+            )
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -201,6 +399,8 @@ class CaptureWindow(QtWidgets.QWidget):
         self._thread = None
         self._worker = None
         self._last_capture_path = None
+        self._last_analysis_path = None
+        self._last_peak_summary = None
         self.setWindowTitle("SoundRadar Capture")
         self.setMinimumWidth(620)
 
@@ -235,9 +435,18 @@ class CaptureWindow(QtWidgets.QWidget):
         self.teacher_combo.addItems(["ast", "efficientat-mn10", "efficientat-mn20"])
         self.analysis_device_combo = QtWidgets.QComboBox()
         self.analysis_device_combo.addItems(["auto", "cpu", "mps", "cuda"])
+        self.threshold_profile_combo = QtWidgets.QComboBox()
+        self.threshold_profile_combo.addItems(list(available_threshold_profiles()))
         self.top_k_spin = QtWidgets.QSpinBox()
         self.top_k_spin.setRange(1, 20)
         self.top_k_spin.setValue(5)
+
+        self.tag_combo = QtWidgets.QComboBox()
+        self.tag_combo.addItems(list(SAMPLE_TAGS))
+        self.notes_edit = QtWidgets.QLineEdit()
+        self.library_edit = QtWidgets.QLineEdit(str(default_library_path()))
+        self.library_browse_button = QtWidgets.QPushButton("Browse")
+        self.save_tag_button = QtWidgets.QPushButton("Save Tag")
 
         self.status_label = QtWidgets.QLabel("Ready")
         self.log = QtWidgets.QPlainTextEdit()
@@ -283,11 +492,23 @@ class CaptureWindow(QtWidgets.QWidget):
         analyze_row.addWidget(self.teacher_combo)
         analyze_row.addWidget(QtWidgets.QLabel("Device"))
         analyze_row.addWidget(self.analysis_device_combo)
+        analyze_row.addWidget(QtWidgets.QLabel("Profile"))
+        analyze_row.addWidget(self.threshold_profile_combo)
         analyze_row.addWidget(QtWidgets.QLabel("Top K"))
         analyze_row.addWidget(self.top_k_spin)
         analyze_row.addStretch(1)
         analyze_row.addWidget(self.analyze_button)
         layout.addLayout(self._labeled_row("Analyze", analyze_row))
+
+        tag_row = QtWidgets.QHBoxLayout()
+        tag_row.addWidget(self.tag_combo)
+        tag_row.addWidget(QtWidgets.QLabel("Notes"))
+        tag_row.addWidget(self.notes_edit, 1)
+        tag_row.addWidget(QtWidgets.QLabel("Library"))
+        tag_row.addWidget(self.library_edit, 1)
+        tag_row.addWidget(self.library_browse_button)
+        tag_row.addWidget(self.save_tag_button)
+        layout.addLayout(self._labeled_row("Tag", tag_row))
 
         action_row = QtWidgets.QHBoxLayout()
         action_row.addWidget(self.status_label, 1)
@@ -311,6 +532,8 @@ class CaptureWindow(QtWidgets.QWidget):
         self.browse_button.clicked.connect(self.browse_output)
         self.record_button.clicked.connect(self.start_recording)
         self.analyze_button.clicked.connect(self.start_analysis)
+        self.library_browse_button.clicked.connect(self.browse_library)
+        self.save_tag_button.clicked.connect(self.save_tag)
 
     def append_log(self, text):
         self.log.appendPlainText(str(text))
@@ -372,6 +595,11 @@ class CaptureWindow(QtWidgets.QWidget):
         if path:
             self.output_edit.setText(path)
 
+    def browse_library(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Library", self.library_edit.text(), "CSV files (*.csv)")
+        if path:
+            self.library_edit.setText(path)
+
     def start_recording(self):
         if self._thread is not None:
             return
@@ -387,6 +615,7 @@ class CaptureWindow(QtWidgets.QWidget):
 
         self.record_button.setEnabled(False)
         self.analyze_button.setEnabled(False)
+        self.save_tag_button.setEnabled(False)
         self.refresh_button.setEnabled(False)
         self.status_label.setText("Recording...")
         self.append_log(f"Recording {seconds:.1f}s from {device['name']} ({channels}ch, {sample_rate} Hz)")
@@ -412,6 +641,8 @@ class CaptureWindow(QtWidgets.QWidget):
     @QtCore.pyqtSlot(str, str, str)
     def _recording_finished(self, path, summary, device_name):
         self._last_capture_path = Path(path)
+        self._last_analysis_path = None
+        self._last_peak_summary = summary
         self.status_label.setText("Saved")
         self.append_log(f"Saved {path}")
         self.append_log(f"Device {device_name}")
@@ -439,6 +670,7 @@ class CaptureWindow(QtWidgets.QWidget):
             audio_path = self.analysis_path()
             teacher_model = self.teacher_combo.currentText()
             device = self.analysis_device_combo.currentText()
+            threshold_profile = self.threshold_profile_combo.currentText()
             top_k = int(self.top_k_spin.value())
         except Exception as exc:
             self.append_log(f"Cannot analyze: {exc}")
@@ -446,6 +678,7 @@ class CaptureWindow(QtWidgets.QWidget):
 
         self.record_button.setEnabled(False)
         self.analyze_button.setEnabled(False)
+        self.save_tag_button.setEnabled(False)
         self.refresh_button.setEnabled(False)
         self.status_label.setText("Analyzing...")
         self.append_log(f"Analyzing {audio_path}")
@@ -457,6 +690,8 @@ class CaptureWindow(QtWidgets.QWidget):
             teacher_model=teacher_model,
             device=device,
             top_k=top_k,
+            peak_summary=self._last_peak_summary if self._last_capture_path == audio_path else None,
+            threshold_profile=threshold_profile,
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -467,10 +702,13 @@ class CaptureWindow(QtWidgets.QWidget):
         self._thread.finished.connect(self._cleanup_worker)
         self._thread.start()
 
-    @QtCore.pyqtSlot(str, str)
-    def _analysis_finished(self, path, summary):
+    @QtCore.pyqtSlot(str, str, str)
+    def _analysis_finished(self, path, summary, result_path):
+        self._last_capture_path = Path(path)
+        self._last_analysis_path = Path(result_path)
         self.status_label.setText("Analyzed")
         self.append_log(f"Analysis complete: {path}")
+        self.append_log(f"Analysis saved: {result_path}")
         self.append_log(summary)
 
     @QtCore.pyqtSlot(str)
@@ -478,9 +716,28 @@ class CaptureWindow(QtWidgets.QWidget):
         self.status_label.setText("Analysis failed")
         self.append_log(f"Analysis failed: {message}")
 
+    def save_tag(self):
+        try:
+            audio_path = self.analysis_path()
+            record = sample_library_record(
+                audio_path=audio_path,
+                tag=self.tag_combo.currentText(),
+                notes=self.notes_edit.text(),
+                analysis_path=self._last_analysis_path,
+                peak_summary=self._last_peak_summary if self._last_capture_path == audio_path else None,
+            )
+            library_path = append_sample_library_record(self.library_edit.text(), record)
+        except Exception as exc:
+            self.append_log(f"Cannot save tag: {exc}")
+            return
+        self.status_label.setText("Tagged")
+        self.append_log(f"Tagged {audio_path} as {record['tag']}")
+        self.append_log(f"Library {library_path}")
+
     def _cleanup_worker(self):
         self.record_button.setEnabled(True)
         self.analyze_button.setEnabled(True)
+        self.save_tag_button.setEnabled(True)
         self.refresh_button.setEnabled(True)
         if self._worker is not None:
             self._worker.deleteLater()

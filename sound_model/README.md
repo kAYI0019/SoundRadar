@@ -133,8 +133,12 @@ then run the direction-event teacher on that saved WAV:
 
 The GUI records the same multichannel WAV as the CLI. After recording, click
 **Analyze** to run the direction-event teacher and show the HUD-style
-`gun cand/show/sup/cd` summary plus direction scores in the GUI log. CLI
-equivalent:
+`gun cand/show/sup/cd` summary plus direction scores in the GUI log. Each
+analysis writes a `*.analysis.json` sidecar containing the peak summary, teacher
+settings, threshold profile, HUD lines, direction scores, top labels, and
+gunshot display decisions. Use the GUI **Tag** row to append reviewed samples to
+a CSV library with `gunshot`, `vehicle`, `footstep`, `unknown`, or `bad sample`
+labels. CLI equivalent:
 
 ```sh
 .venv/bin/python -m sound_model.capture_direction_sample \
@@ -152,6 +156,10 @@ equivalent:
 Use this for real game/app gunshot and vehicle tuning. It is different from
 `sound_model.surround_probe`, which only verifies that discrete 7.1 channels are
 routed into SoundRadar without downmixing.
+
+The GUI analysis summary can be evaluated under the same threshold profiles as
+the runtime overlay: `default`, `quiet`, `aggressive`, and `debug`. For the live
+overlay, pass `--threshold-profile quiet` or set `SOUNDRADAR_THRESHOLD_PROFILE`.
 
 ## Full 7-direction benchmark
 
