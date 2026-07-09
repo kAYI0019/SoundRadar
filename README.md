@@ -73,6 +73,49 @@ Expected result:
 BlackHole 16ch 16 16
 ```
 
+YouTube and most browser playback are usually stereo/downmixed, so they are not
+reliable 7.1 routing tests. Use the local routing probe to verify that discrete
+Audio MIDI 7.1 channels reach SoundRadar without browser/player downmixing:
+
+```sh
+.venv/bin/python -m sound_model.surround_probe --list-devices
+.venv/bin/python -m sound_model.surround_probe --device "BlackHole 16ch" --channels 16 --kind both
+```
+
+Run SoundRadar with BlackHole 16ch selected as its input while the probe plays.
+The probe is a channel-routing check, not a classifier benchmark: the synthetic
+gunshot/vehicle sounds are only there to make per-channel overlay movement easy
+to see. It emits directions in Audio MIDI 7.1 order: front-left, front,
+front-right, left, right, rear-left, rear-right.
+
+To inspect the channel layout in a DAW or multichannel-capable player, write an
+8/16-channel WAV instead:
+
+```sh
+.venv/bin/python -m sound_model.surround_probe --kind both --channels 8 --write-wav /tmp/soundradar-7.1-probe.wav --no-play
+```
+
+For real game/app tuning, capture the actual BlackHole 16ch input and replay it
+through the direction-event teacher:
+
+```sh
+.venv/bin/python -m sound_model.capture_direction_sample_gui
+```
+
+The capture GUI lets you pick the input device, duration, channel count, and WAV
+output path. After recording, click **Analyze** to run the direction-event
+teacher and show the HUD-style `gun cand/show/sup/cd` summary plus direction
+scores in the GUI log. The same capture path is available as a CLI:
+
+```sh
+.venv/bin/python -m sound_model.capture_direction_sample --device "BlackHole 16ch" --seconds 20 --out /tmp/pubg-sample.wav
+.venv/bin/python -m sound_model.direction_events /tmp/pubg-sample.wav --teacher-model ast --device auto --top-k 5
+```
+
+This preserves the captured multichannel layout, so it is the preferred way to
+debug gunshot/vehicle thresholds and direction suppression with repeatable real
+samples.
+
 Run the application:
 
 ```sh

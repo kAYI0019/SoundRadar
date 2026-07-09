@@ -122,6 +122,37 @@ Input behavior:
 This is intended for teacher/pseudo-labeling and prototyping. Real-time use will
 likely need batching, cooldown/smoothing, and eventually a smaller student model.
 
+## Real 7.1 capture/replay samples
+
+For repeatable tuning, record the actual virtual input that SoundRadar sees,
+then run the direction-event teacher on that saved WAV:
+
+```sh
+.venv/bin/python -m sound_model.capture_direction_sample_gui
+```
+
+The GUI records the same multichannel WAV as the CLI. After recording, click
+**Analyze** to run the direction-event teacher and show the HUD-style
+`gun cand/show/sup/cd` summary plus direction scores in the GUI log. CLI
+equivalent:
+
+```sh
+.venv/bin/python -m sound_model.capture_direction_sample \
+  --device "BlackHole 16ch" \
+  --seconds 20 \
+  --out /tmp/pubg-sample.wav
+
+.venv/bin/python -m sound_model.direction_events \
+  /tmp/pubg-sample.wav \
+  --teacher-model ast \
+  --device auto \
+  --top-k 5
+```
+
+Use this for real game/app gunshot and vehicle tuning. It is different from
+`sound_model.surround_probe`, which only verifies that discrete 7.1 channels are
+routed into SoundRadar without downmixing.
+
 ## Full 7-direction benchmark
 
 Use the benchmark CLI before and after optimization, or when comparing MPS vs
