@@ -159,6 +159,59 @@ def channel_peak_summary(audio: np.ndarray, *, max_channels: int = 8) -> str:
     return " ".join(f"ch{index}={peak:.3f}" for index, peak in enumerate(peaks))
 
 
+def active_channel_indices(audio: np.ndarray, *, threshold: float = 1.0e-4, max_channels: int | None = 8) -> tuple[int, ...]:
+    samples = np.asarray(audio, dtype=np.float32)
+    if samples.ndim == 1:
+        samples = samples[:, None]
+    if samples.size == 0:
+        return tuple()
+    channel_count = samples.shape[1] if max_channels is None else min(samples.shape[1], int(max_channels))
+    peaks = np.max(np.abs(samples[:, :channel_count]), axis=0)
+    return tuple(index for index, peak in enumerate(peaks) if float(peak) >= float(threshold))
+
+
+def active_channel_summary(audio: np.ndarray, *, threshold: float = 1.0e-4, max_channels: int | None = 8) -> str:
+    active = active_channel_indices(audio, threshold=threshold, max_channels=max_channels)
+    return "active channels: " + (",".join(f"ch{index}" for index in active) if active else "none")
+
+
+def device_sanity_lines(device_info: Mapping[str, object], *, selected_channels: int | None = None) -> list[str]:
+    max_channels = device_input_channels(device_info)
+    selected = max_channels if selected_channels is None else int(selected_channels)
+    sample_rate = device_default_sample_rate(device_info)
+    lines = []
+    if max_channels >= 8 and selected >= 8:
+        lines.append(f"OK: input exposes {max_channels} channels and will capture {selected} channels")
+    elif max_channels >= 8:
+        lines.append(f"Warning: device exposes {max_channels} channels, but capture is limited to {selected}")
+    else:
+        lines.append(f"Warning: input exposes only {max_channels} channel(s); true 7.1 capture is not available")
+    if sample_rate != 48_000:
+        lines.append(f"Note: device default sample rate is {sample_rate} Hz, not 48000 Hz")
+    return lines
+
+
+def capture_sanity_lines(
+    audio: np.ndarray,
+    *,
+    expected_channels: int,
+    active_threshold: float = 1.0e-4,
+) -> list[str]:
+    samples = np.asarray(audio, dtype=np.float32)
+    if samples.ndim == 1:
+        samples = samples[:, None]
+    captured_channels = 0 if samples.size == 0 else samples.shape[1]
+    active = active_channel_indices(samples, threshold=active_threshold, max_channels=min(max(1, expected_channels), 8))
+    lines = [active_channel_summary(samples, threshold=active_threshold, max_channels=min(max(1, expected_channels), 8))]
+    if expected_channels >= 8 and captured_channels < 8:
+        lines.append(f"Warning: expected {expected_channels} channels but captured only {captured_channels}")
+    elif expected_channels >= 8 and len(active) <= 2:
+        lines.append("Warning: multichannel capture has signal on only two or fewer 7.1 channels; source may be stereo/downmixed")
+    elif expected_channels >= 8:
+        lines.append("OK: captured signal spans more than two 7.1 channels")
+    return lines
+
+
 def print_device_list(sd_module) -> None:
     print(sd_module.query_devices())
 
@@ -202,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
     write_wav(args.out, audio, sample_rate)
     print(f"wrote {args.out}")
     print(f"peaks {channel_peak_summary(audio)}")
+    for line in capture_sanity_lines(audio, expected_channels=channels):
+        print(line)
     if channels < 8:
         print("warning: fewer than 8 channels were captured, so replay will use stereo/mono fallback")
     return 0

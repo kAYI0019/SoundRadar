@@ -8,6 +8,7 @@ venv/
 
 # IDE/project-local settings
 .idea/
+soundradar.local.json
 
 # Agent/local planning artifacts
 .hermes/

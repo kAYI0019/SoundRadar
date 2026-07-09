@@ -5,9 +5,12 @@ import wave
 import numpy as np
 
 from sound_model.capture_direction_sample import (
+    active_channel_indices,
+    capture_sanity_lines,
     channel_peak_summary,
     choose_recording_channels,
     device_default_sample_rate,
+    device_sanity_lines,
     parse_device_id,
     record_input_audio,
     sample_count_for_duration,
@@ -95,6 +98,29 @@ class CaptureDirectionSampleTests(unittest.TestCase):
         self.assertIn("ch0=0.250", summary)
         self.assertIn("ch7=0.750", summary)
         self.assertNotIn("ch8=", summary)
+
+    def test_active_channel_indices_reports_channels_above_threshold(self):
+        audio = np.zeros((4, 8), dtype=np.float32)
+        audio[:, 0] = 0.01
+        audio[:, 5] = 0.20
+
+        self.assertEqual(active_channel_indices(audio, threshold=0.001), (0, 5))
+
+    def test_capture_sanity_warns_when_multichannel_capture_looks_stereo(self):
+        audio = np.zeros((4, 8), dtype=np.float32)
+        audio[:, 0] = 0.1
+        audio[:, 1] = 0.1
+
+        lines = capture_sanity_lines(audio, expected_channels=8)
+
+        self.assertIn("active channels: ch0,ch1", lines[0])
+        self.assertTrue(any("source may be stereo/downmixed" in line for line in lines))
+
+    def test_device_sanity_lines_warn_for_non_surround_input(self):
+        lines = device_sanity_lines({"name": "Built-in Mic", "max_input_channels": 1, "default_samplerate": 44100})
+
+        self.assertTrue(any("true 7.1 capture is not available" in line for line in lines))
+        self.assertTrue(any("44100" in line for line in lines))
 
     def test_capture_output_wav_can_preserve_16_channels(self):
         audio = np.zeros((12, 16), dtype=np.float32)

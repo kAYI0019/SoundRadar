@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "teacher_model": "efficientat-mn20",
+  "device": "auto",
+  "dtype": "auto",
+  "top_k": 5,
+  "threshold_profile": "default",
+  "window_seconds": 1.0,
+  "interval_seconds": 1.25,
+  "warmup": true,
+  "rolling_capture_enabled": true,
+  "rolling_capture_seconds": 5.0,
+  "rolling_capture_dir": "~/SoundRadarSamples/rolling",
+  "rolling_capture_trigger_path": "/tmp/soundradar-save-rolling"
+}

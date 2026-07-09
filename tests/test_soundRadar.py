@@ -1,5 +1,7 @@
 import ctypes
+import json
 import queue
+import tempfile
 from types import SimpleNamespace
 import sys
 import unittest
@@ -876,6 +878,134 @@ class SoundRadarThresholdProfileTests(unittest.TestCase):
         self.assertEqual(soundRadar.AST_DIRECTION_EVENT_THRESHOLD, profile.direction_event_threshold)
         self.assertEqual(soundRadar.DIRECTION_EVENT_DISPLAY_THRESHOLDS["gunshot"], 0.16)
         self.assertEqual(soundRadar.GUNSHOT_SPATIAL_MAX_DIRECTIONS, 1)
+
+
+class SoundRadarRuntimeConfigTests(unittest.TestCase):
+    def setUp(self):
+        self._settings = {
+            "ENABLE_AST_DIRECTION_EVENTS": soundRadar.ENABLE_AST_DIRECTION_EVENTS,
+            "AST_DIRECTION_EVENT_TEACHER_MODEL": soundRadar.AST_DIRECTION_EVENT_TEACHER_MODEL,
+            "AST_DIRECTION_EVENT_MODEL_ID": soundRadar.AST_DIRECTION_EVENT_MODEL_ID,
+            "AST_DIRECTION_EVENT_DEVICE": soundRadar.AST_DIRECTION_EVENT_DEVICE,
+            "AST_DIRECTION_EVENT_DTYPE": soundRadar.AST_DIRECTION_EVENT_DTYPE,
+            "AST_DIRECTION_EVENT_ATTN_IMPLEMENTATION": soundRadar.AST_DIRECTION_EVENT_ATTN_IMPLEMENTATION,
+            "AST_DIRECTION_EVENT_COMPILE": soundRadar.AST_DIRECTION_EVENT_COMPILE,
+            "AST_DIRECTION_EVENT_TOP_K": soundRadar.AST_DIRECTION_EVENT_TOP_K,
+            "AST_DIRECTION_EVENT_WINDOW_SECONDS": soundRadar.AST_DIRECTION_EVENT_WINDOW_SECONDS,
+            "AST_DIRECTION_EVENT_INTERVAL": soundRadar.AST_DIRECTION_EVENT_INTERVAL,
+            "AST_DIRECTION_EVENT_WARMUP": soundRadar.AST_DIRECTION_EVENT_WARMUP,
+            "ROLLING_CAPTURE_ENABLED": soundRadar.ROLLING_CAPTURE_ENABLED,
+            "ROLLING_CAPTURE_SECONDS": soundRadar.ROLLING_CAPTURE_SECONDS,
+            "ROLLING_CAPTURE_DIR": soundRadar.ROLLING_CAPTURE_DIR,
+            "ROLLING_CAPTURE_TRIGGER_PATH": soundRadar.ROLLING_CAPTURE_TRIGGER_PATH,
+        }
+
+    def tearDown(self):
+        for name, value in self._settings.items():
+            setattr(soundRadar, name, value)
+        soundRadar.apply_threshold_profile("default")
+
+    def test_load_runtime_config_reads_json_object(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/soundradar.local.json"
+            with open(path, "w", encoding="utf-8") as config_file:
+                json.dump({"teacher_model": "ast", "threshold_profile": "quiet"}, config_file)
+
+            config = soundRadar.load_runtime_config(path)
+
+        self.assertEqual(config["teacher_model"], "ast")
+        self.assertEqual(config["threshold_profile"], "quiet")
+
+    def test_apply_runtime_config_updates_runtime_settings_without_code_edits(self):
+        soundRadar.apply_runtime_config(
+            {
+                "enable_direction_events": False,
+                "teacher_model": "ast",
+                "model_id": "custom/model",
+                "device": "mps",
+                "dtype": "float16",
+                "attn_implementation": "sdpa",
+                "compile_model": "reduce-overhead",
+                "top_k": 7,
+                "window_seconds": 1.5,
+                "interval_seconds": 0.75,
+                "warmup": "off",
+                "rolling_capture_enabled": True,
+                "rolling_capture_seconds": 3.5,
+                "rolling_capture_dir": "/tmp/soundradar-roll",
+                "rolling_capture_trigger_path": "/tmp/soundradar-trigger",
+            }
+        )
+
+        self.assertFalse(soundRadar.ENABLE_AST_DIRECTION_EVENTS)
+        self.assertEqual(soundRadar.AST_DIRECTION_EVENT_TEACHER_MODEL, "ast")
+        self.assertEqual(soundRadar.AST_DIRECTION_EVENT_MODEL_ID, "custom/model")
+        self.assertEqual(soundRadar.AST_DIRECTION_EVENT_DEVICE, "mps")
+        self.assertEqual(soundRadar.AST_DIRECTION_EVENT_DTYPE, "float16")
+        self.assertEqual(soundRadar.AST_DIRECTION_EVENT_ATTN_IMPLEMENTATION, "sdpa")
+        self.assertEqual(soundRadar.AST_DIRECTION_EVENT_COMPILE, "reduce-overhead")
+        self.assertEqual(soundRadar.AST_DIRECTION_EVENT_TOP_K, 7)
+        self.assertEqual(soundRadar.AST_DIRECTION_EVENT_WINDOW_SECONDS, 1.5)
+        self.assertEqual(soundRadar.AST_DIRECTION_EVENT_INTERVAL, 0.75)
+        self.assertFalse(soundRadar.AST_DIRECTION_EVENT_WARMUP)
+        self.assertTrue(soundRadar.ROLLING_CAPTURE_ENABLED)
+        self.assertEqual(soundRadar.ROLLING_CAPTURE_SECONDS, 3.5)
+        self.assertEqual(soundRadar.ROLLING_CAPTURE_DIR, "/tmp/soundradar-roll")
+        self.assertEqual(soundRadar.ROLLING_CAPTURE_TRIGGER_PATH, "/tmp/soundradar-trigger")
+
+    def test_parse_threshold_profile_args_uses_config_then_env_then_cli(self):
+        qt_args, env_profile = soundRadar.parse_threshold_profile_args(
+            ["soundRadar.py", "-platform", "offscreen"],
+            environ={soundRadar.THRESHOLD_PROFILE_ENV: "aggressive"},
+            runtime_config={"threshold_profile": "quiet"},
+        )
+        cli_args, cli_profile = soundRadar.parse_threshold_profile_args(
+            ["soundRadar.py", "--threshold-profile=debug"],
+            environ={soundRadar.THRESHOLD_PROFILE_ENV: "aggressive"},
+            runtime_config={"threshold_profile": "quiet"},
+        )
+
+        self.assertEqual(qt_args, ["soundRadar.py", "-platform", "offscreen"])
+        self.assertEqual(env_profile, "aggressive")
+        self.assertEqual(cli_args, ["soundRadar.py"])
+        self.assertEqual(cli_profile, "debug")
+
+
+class SoundRadarRollingCaptureTests(unittest.TestCase):
+    def test_rolling_audio_capture_keeps_recent_window(self):
+        capture = soundRadar.RollingAudioCapture(sample_rate=10, channel_count=2, seconds=0.3)
+        capture.append_blocks([soundRadar.np.ones((4, 2), dtype=soundRadar.np.float32)], capture_time=10.0)
+        capture.append_blocks([soundRadar.np.full((2, 2), 2.0, dtype=soundRadar.np.float32)], capture_time=10.2)
+
+        snapshot = capture.snapshot()
+
+        self.assertEqual(snapshot.audio.shape, (3, 2))
+        soundRadar.np.testing.assert_array_equal(snapshot.audio[-1], [2.0, 2.0])
+        self.assertAlmostEqual(snapshot.end_capture_time, 10.2)
+        self.assertAlmostEqual(snapshot.start_capture_time, 9.9)
+
+    def test_write_rolling_capture_snapshot_writes_wav_and_metadata(self):
+        capture = soundRadar.RollingAudioCapture(sample_rate=10, channel_count=8, seconds=1.0)
+        audio = soundRadar.np.zeros((5, 8), dtype=soundRadar.np.float32)
+        audio[:, 0] = 0.5
+        audio[:, 1] = 0.5
+        capture.append_blocks([audio], capture_time=10.0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path, metadata_path = soundRadar.write_rolling_capture_snapshot(
+                capture.snapshot(),
+                directory=tmpdir,
+                now=10.25,
+                threshold_profile_name="default",
+            )
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(str(audio_path).endswith(".wav"))
+        self.assertEqual(metadata["sample_rate"], 10)
+        self.assertEqual(metadata["channel_count"], 8)
+        self.assertEqual(metadata["threshold_profile"], "default")
+        self.assertIn("ch0=0.500", metadata["peak_summary"])
+        self.assertTrue(any("stereo/downmixed" in line for line in metadata["sanity_lines"]))
 
 
 class SoundRadarWindowTests(unittest.TestCase):

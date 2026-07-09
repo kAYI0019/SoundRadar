@@ -136,9 +136,12 @@ The GUI records the same multichannel WAV as the CLI. After recording, click
 `gun cand/show/sup/cd` summary plus direction scores in the GUI log. Each
 analysis writes a `*.analysis.json` sidecar containing the peak summary, teacher
 settings, threshold profile, HUD lines, direction scores, top labels, and
-gunshot display decisions. Use the GUI **Tag** row to append reviewed samples to
-a CSV library with `gunshot`, `vehicle`, `footstep`, `unknown`, or `bad sample`
-labels. CLI equivalent:
+gunshot display decisions. The GUI also shows channel sanity messages and warns
+when an 8+ channel recording only has stereo-like active channels. Use
+**Compare Profiles** to write `*.profile-comparison.json` from the same teacher
+prediction for `default`, `quiet`, `aggressive`, and `debug`. Use the GUI
+**Tag** row to append reviewed samples to a CSV library with `gunshot`,
+`vehicle`, `footstep`, `unknown`, or `bad sample` labels. CLI equivalent:
 
 ```sh
 .venv/bin/python -m sound_model.capture_direction_sample \
@@ -160,6 +163,20 @@ routed into SoundRadar without downmixing.
 The GUI analysis summary can be evaluated under the same threshold profiles as
 the runtime overlay: `default`, `quiet`, `aggressive`, and `debug`. For the live
 overlay, pass `--threshold-profile quiet` or set `SOUNDRADAR_THRESHOLD_PROFILE`.
+
+After collecting tagged samples, re-evaluate the library across profiles:
+
+```sh
+.venv/bin/python -m sound_model.evaluate_sample_library \
+  ~/SoundRadarSamples/sample_library.csv \
+  --teacher-model ast \
+  --device auto \
+  --top-k 5
+```
+
+This writes `sample_library.evaluation.csv` by default, with one row per
+sample/profile pair. Use it to compare missed `gunshot`/`vehicle`/`footstep`
+tags, duplicate display events, and gunshot direction suppression.
 
 ## Full 7-direction benchmark
 

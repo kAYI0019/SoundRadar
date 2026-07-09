@@ -107,8 +107,12 @@ output path. After recording, click **Analyze** to run the direction-event
 teacher and show the HUD-style `gun cand/show/sup/cd` summary plus direction
 scores in the GUI log. Analysis also writes a `*.analysis.json` file next to the
 WAV with the peak summary, teacher settings, HUD lines, direction scores, and
-gunshot display decisions. Use the **Tag** row to append the current sample to a
-CSV library as `gunshot`, `vehicle`, `footstep`, `unknown`, or `bad sample`.
+gunshot display decisions. Click **Compare Profiles** to write a
+`*.profile-comparison.json` file and compare `default`, `quiet`, `aggressive`,
+and `debug` display behavior from the same teacher prediction. Use the **Tag**
+row to append the current sample to a CSV library as `gunshot`, `vehicle`,
+`footstep`, `unknown`, or `bad sample`. The GUI also shows device/channel sanity
+messages and warns when an 8+ channel recording only contains stereo-like signal.
 The same capture path is available as a CLI:
 
 ```sh
@@ -120,11 +124,32 @@ This preserves the captured multichannel layout, so it is the preferred way to
 debug gunshot/vehicle thresholds and direction suppression with repeatable real
 samples.
 
+Re-evaluate a tagged sample library after changing thresholds:
+
+```sh
+.venv/bin/python -m sound_model.evaluate_sample_library \
+  ~/SoundRadarSamples/sample_library.csv \
+  --teacher-model ast \
+  --device auto \
+  --top-k 5
+```
+
 Run the application:
 
 ```sh
 .venv/bin/python -u soundRadar.py
 ```
+
+Local runtime settings can be kept out of git:
+
+```sh
+cp soundradar.local.example.json soundradar.local.json
+```
+
+Edit `soundradar.local.json` for machine-specific settings such as
+`teacher_model`, `device`, `top_k`, `threshold_profile`, and rolling capture
+paths. The file is ignored by git, so switching between `ast` and
+`efficientat-mn20` no longer requires editing `soundRadar.py`.
 
 Threshold/cooldown tuning can be selected without editing code:
 
@@ -136,6 +161,18 @@ SOUNDRADAR_THRESHOLD_PROFILE=aggressive .venv/bin/python -u soundRadar.py
 Available profiles are `default`, `quiet`, `aggressive`, and `debug`. `quiet`
 raises thresholds and lengthens cooldowns to reduce visual spam, while
 `aggressive` and `debug` make detection/display more permissive for tuning.
+
+While the live overlay is running, save the latest rolling audio buffer for a
+bad/interesting moment by creating the trigger file:
+
+```sh
+touch /tmp/soundradar-save-rolling
+```
+
+By default this writes a WAV plus JSON metadata under
+`~/SoundRadarSamples/rolling`. The JSON includes peak summary, channel sanity
+messages, threshold profile, and the latest direction-event prediction when one
+is available.
 
 ### Optional Hugging Face AST model
 

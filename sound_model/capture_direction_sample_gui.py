@@ -13,10 +13,12 @@ from PyQt5 import QtCore, QtWidgets
 
 from .audio_features import read_wav, write_wav
 from .capture_direction_sample import (
+    capture_sanity_lines,
     channel_peak_summary,
     choose_recording_channels,
     device_default_sample_rate,
     device_input_channels,
+    device_sanity_lines,
     record_input_audio,
     select_input_device,
 )
@@ -84,6 +86,10 @@ def analysis_result_path(audio_path: str | Path) -> Path:
     return Path(audio_path).with_suffix(".analysis.json")
 
 
+def profile_comparison_result_path(audio_path: str | Path) -> Path:
+    return Path(audio_path).with_suffix(".profile-comparison.json")
+
+
 def default_library_path(directory: str | Path | None = None) -> Path:
     base = Path(directory) if directory is not None else Path.home() / "SoundRadarSamples"
     return base / "sample_library.csv"
@@ -131,18 +137,35 @@ def direction_score_summary_lines(prediction) -> list[str]:
     return lines
 
 
-def _display_debug_for_prediction(prediction, *, threshold_profile: str = "default"):
+def displayed_events_for_prediction(prediction, *, threshold_profile: str = "default"):
     import soundRadar
 
     soundRadar.apply_threshold_profile(threshold_profile)
     display_debug = {}
-    soundRadar.create_pulses_from_direction_events(
+    pulses = soundRadar.create_pulses_from_direction_events(
         prediction,
         now=0.0,
         threshold=soundRadar.AST_DIRECTION_EVENT_THRESHOLD,
+        cooldown=soundRadar.AST_DIRECTION_EVENT_COOLDOWN,
         display_debug=display_debug,
     )
-    return display_debug.get("debug")
+    direction_by_sector = {sector: direction for direction, sector in soundRadar.DIRECTION_EVENT_SECTORS.items()}
+    events = [
+        {
+            "direction": direction_by_sector.get(int(pulse.sector), str(pulse.sector)),
+            "sector": int(pulse.sector),
+            "event": str(pulse.kind),
+            "score": float(pulse.strength),
+        }
+        for pulse in pulses
+        if soundRadar.is_classified_event_kind(getattr(pulse, "kind", ""))
+    ]
+    return events, display_debug.get("debug")
+
+
+def _display_debug_for_prediction(prediction, *, threshold_profile: str = "default"):
+    _, display_debug = displayed_events_for_prediction(prediction, threshold_profile=threshold_profile)
+    return display_debug
 
 
 def hud_summary_lines(prediction, *, display_debug=None, threshold_profile: str = "default") -> list[str]:
@@ -167,6 +190,86 @@ def prediction_summary_text(prediction, *, threshold_profile: str = "default") -
     lines.append("")
     lines.extend(direction_score_summary_lines(prediction))
     return "\n".join(lines)
+
+
+def max_event_score(prediction, event_name: str) -> float:
+    scores_by_direction = getattr(prediction, "direction_event_scores", {}) or {}
+    return max(
+        (float((scores or {}).get(event_name, 0.0)) for scores in scores_by_direction.values()),
+        default=0.0,
+    )
+
+
+def profile_summary_payload(prediction, profile_name: str) -> dict[str, object]:
+    events, display_debug = displayed_events_for_prediction(prediction, threshold_profile=profile_name)
+    hud_lines = hud_summary_lines(prediction, display_debug=display_debug, threshold_profile=profile_name)
+    return {
+        "profile": str(profile_name),
+        "shown_events": events,
+        "shown_event_count": len(events),
+        "shown_event_types": sorted({event["event"] for event in events}),
+        "max_scores": {event_name: max_event_score(prediction, event_name) for event_name in EVENT_SCORE_ORDER},
+        "hud_summary_lines": hud_lines,
+        "gunshot_display": _gunshot_debug_payload(display_debug),
+    }
+
+
+def compare_threshold_profiles(prediction, profiles=None) -> list[dict[str, object]]:
+    profiles = tuple(profiles or available_threshold_profiles())
+    return [profile_summary_payload(prediction, profile_name) for profile_name in profiles]
+
+
+def format_profile_comparison(comparisons) -> str:
+    lines = ["profile comparison:"]
+    for summary in comparisons:
+        shown = summary.get("shown_events", ())
+        if shown:
+            event_text = ", ".join(
+                f"{event['event']}:{DIRECTION_LABELS.get(event['direction'], event['direction'])} {compact_score(event['score'])}"
+                for event in shown
+            )
+        else:
+            event_text = "--"
+        gunshot_display = summary.get("gunshot_display", {}) or {}
+        gunshot_shown = "/".join(
+            DIRECTION_LABELS.get(direction, direction)
+            for direction in gunshot_display.get("shown_directions", ())
+        ) or "--"
+        gunshot_suppressed = "/".join(
+            DIRECTION_LABELS.get(direction, direction)
+            for direction in gunshot_display.get("spatially_suppressed_directions", ())
+        ) or "--"
+        lines.append(
+            f"{summary['profile']:<10} shown {event_text} "
+            f"gun show {gunshot_shown} sup {gunshot_suppressed}"
+        )
+    return "\n".join(lines)
+
+
+def profile_comparison_payload(
+    prediction,
+    *,
+    audio_path: str | Path,
+    teacher_model: str,
+    device: str,
+    top_k: int,
+    peak_summary: str | None = None,
+    profiles=None,
+    analyzed_at: datetime | None = None,
+) -> dict[str, object]:
+    analyzed_at = analyzed_at or datetime.now()
+    comparisons = compare_threshold_profiles(prediction, profiles=profiles)
+    return {
+        "schema_version": 1,
+        "analyzed_at": analyzed_at.isoformat(timespec="seconds"),
+        "audio_path": str(Path(audio_path)),
+        "peak_summary": peak_summary,
+        "teacher_model": str(teacher_model),
+        "device": str(device),
+        "top_k": int(top_k),
+        "profiles": comparisons,
+        "prediction": prediction.to_jsonable() if hasattr(prediction, "to_jsonable") else None,
+    }
 
 
 def _prediction_scores_payload(prediction) -> dict[str, object]:
@@ -263,6 +366,18 @@ def write_prediction_result_json(
     return path
 
 
+def write_profile_comparison_json(
+    audio_path: str | Path,
+    payload: dict[str, object],
+    *,
+    result_path: str | Path | None = None,
+) -> Path:
+    path = Path(result_path) if result_path is not None else profile_comparison_result_path(audio_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+
 def sample_library_record(
     *,
     audio_path: str | Path,
@@ -307,7 +422,7 @@ def _plain_device_info(device_info):
 
 
 class CaptureWorker(QtCore.QObject):
-    finished = QtCore.pyqtSignal(str, str, str)
+    finished = QtCore.pyqtSignal(str, str, str, str)
     failed = QtCore.pyqtSignal(str)
 
     def __init__(self, *, device_index: int, device_name: str, seconds: float, output_path: Path, channels: int, sample_rate: int):
@@ -333,7 +448,8 @@ class CaptureWorker(QtCore.QObject):
             )
             write_wav(self.output_path, audio, self.sample_rate)
             summary = channel_peak_summary(audio)
-            self.finished.emit(str(self.output_path), summary, self.device_name)
+            sanity = "\n".join(capture_sanity_lines(audio, expected_channels=self.channels))
+            self.finished.emit(str(self.output_path), summary, self.device_name, sanity)
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -393,6 +509,59 @@ class AnalysisWorker(QtCore.QObject):
             self.failed.emit(str(exc))
 
 
+class ProfileCompareWorker(QtCore.QObject):
+    finished = QtCore.pyqtSignal(str, str, str)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        audio_path: Path,
+        teacher_model: str,
+        device: str,
+        top_k: int,
+        peak_summary: str | None = None,
+        profiles=None,
+    ):
+        super().__init__()
+        self.audio_path = Path(audio_path)
+        self.teacher_model = str(teacher_model)
+        self.device = str(device)
+        self.top_k = int(top_k)
+        self.peak_summary = peak_summary
+        self.profiles = tuple(profiles or available_threshold_profiles())
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            from .direction_events import predict_direction_events_file
+
+            prediction = predict_direction_events_file(
+                self.audio_path,
+                teacher_model=self.teacher_model,
+                device=self.device,
+                top_k=self.top_k,
+            )
+            peak_summary = self.peak_summary if self.peak_summary is not None else peak_summary_for_file(self.audio_path)
+            payload = profile_comparison_payload(
+                prediction,
+                audio_path=self.audio_path,
+                teacher_model=self.teacher_model,
+                device=self.device,
+                top_k=self.top_k,
+                peak_summary=peak_summary,
+                profiles=self.profiles,
+            )
+            result_path = write_profile_comparison_json(self.audio_path, payload)
+            self.finished.emit(
+                str(self.audio_path),
+                format_profile_comparison(payload["profiles"]),
+                str(result_path),
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class CaptureWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
@@ -424,12 +593,15 @@ class CaptureWindow(QtWidgets.QWidget):
         self.sample_rate_spin.setValue(48_000)
         self.sample_rate_auto = QtWidgets.QCheckBox("Auto")
         self.sample_rate_auto.setChecked(True)
+        self.sanity_label = QtWidgets.QLabel("")
+        self.sanity_label.setWordWrap(True)
 
         self.output_edit = QtWidgets.QLineEdit(str(default_capture_path()))
         self.browse_button = QtWidgets.QPushButton("Browse")
         self.record_button = QtWidgets.QPushButton("Record")
         self.record_button.setDefault(True)
         self.analyze_button = QtWidgets.QPushButton("Analyze")
+        self.compare_button = QtWidgets.QPushButton("Compare Profiles")
 
         self.teacher_combo = QtWidgets.QComboBox()
         self.teacher_combo.addItems(["ast", "efficientat-mn10", "efficientat-mn20"])
@@ -482,6 +654,10 @@ class CaptureWindow(QtWidgets.QWidget):
         rate_row.addStretch(1)
         layout.addLayout(self._labeled_row("Sample Rate", rate_row))
 
+        sanity_row = QtWidgets.QHBoxLayout()
+        sanity_row.addWidget(self.sanity_label, 1)
+        layout.addLayout(self._labeled_row("Sanity", sanity_row))
+
         output_row = QtWidgets.QHBoxLayout()
         output_row.addWidget(self.output_edit, 1)
         output_row.addWidget(self.browse_button)
@@ -498,6 +674,7 @@ class CaptureWindow(QtWidgets.QWidget):
         analyze_row.addWidget(self.top_k_spin)
         analyze_row.addStretch(1)
         analyze_row.addWidget(self.analyze_button)
+        analyze_row.addWidget(self.compare_button)
         layout.addLayout(self._labeled_row("Analyze", analyze_row))
 
         tag_row = QtWidgets.QHBoxLayout()
@@ -528,10 +705,12 @@ class CaptureWindow(QtWidgets.QWidget):
         self.refresh_button.clicked.connect(self.refresh_devices)
         self.device_combo.currentIndexChanged.connect(self._sync_device_defaults)
         self.channels_auto.toggled.connect(self._sync_device_defaults)
+        self.channels_spin.valueChanged.connect(self._sync_sanity_label)
         self.sample_rate_auto.toggled.connect(self._sync_device_defaults)
         self.browse_button.clicked.connect(self.browse_output)
         self.record_button.clicked.connect(self.start_recording)
         self.analyze_button.clicked.connect(self.start_analysis)
+        self.compare_button.clicked.connect(self.start_profile_comparison)
         self.library_browse_button.clicked.connect(self.browse_library)
         self.save_tag_button.clicked.connect(self.save_tag)
 
@@ -589,6 +768,15 @@ class CaptureWindow(QtWidgets.QWidget):
             self.sample_rate_spin.setEnabled(False)
         else:
             self.sample_rate_spin.setEnabled(True)
+        self._sync_sanity_label()
+
+    def _sync_sanity_label(self):
+        data = self.device_combo.currentData()
+        if data is None:
+            self.sanity_label.setText("")
+            return
+        _, device = data
+        self.sanity_label.setText(" | ".join(device_sanity_lines(device, selected_channels=self.channels_spin.value())))
 
     def browse_output(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Capture", self.output_edit.text(), "WAV files (*.wav)")
@@ -615,10 +803,13 @@ class CaptureWindow(QtWidgets.QWidget):
 
         self.record_button.setEnabled(False)
         self.analyze_button.setEnabled(False)
+        self.compare_button.setEnabled(False)
         self.save_tag_button.setEnabled(False)
         self.refresh_button.setEnabled(False)
         self.status_label.setText("Recording...")
         self.append_log(f"Recording {seconds:.1f}s from {device['name']} ({channels}ch, {sample_rate} Hz)")
+        for line in device_sanity_lines(device, selected_channels=channels):
+            self.append_log(f"Sanity {line}")
 
         self._thread = QtCore.QThread(self)
         self._worker = CaptureWorker(
@@ -638,8 +829,8 @@ class CaptureWindow(QtWidgets.QWidget):
         self._thread.finished.connect(self._cleanup_worker)
         self._thread.start()
 
-    @QtCore.pyqtSlot(str, str, str)
-    def _recording_finished(self, path, summary, device_name):
+    @QtCore.pyqtSlot(str, str, str, str)
+    def _recording_finished(self, path, summary, device_name, sanity):
         self._last_capture_path = Path(path)
         self._last_analysis_path = None
         self._last_peak_summary = summary
@@ -647,6 +838,8 @@ class CaptureWindow(QtWidgets.QWidget):
         self.append_log(f"Saved {path}")
         self.append_log(f"Device {device_name}")
         self.append_log(f"Peaks {summary}")
+        if sanity:
+            self.append_log(sanity)
         self.append_log(f"Analyze: {direction_events_command(path)}")
         self.output_edit.setText(str(default_capture_path()))
 
@@ -678,6 +871,7 @@ class CaptureWindow(QtWidgets.QWidget):
 
         self.record_button.setEnabled(False)
         self.analyze_button.setEnabled(False)
+        self.compare_button.setEnabled(False)
         self.save_tag_button.setEnabled(False)
         self.refresh_button.setEnabled(False)
         self.status_label.setText("Analyzing...")
@@ -716,6 +910,58 @@ class CaptureWindow(QtWidgets.QWidget):
         self.status_label.setText("Analysis failed")
         self.append_log(f"Analysis failed: {message}")
 
+    def start_profile_comparison(self):
+        if self._thread is not None:
+            return
+        try:
+            audio_path = self.analysis_path()
+            teacher_model = self.teacher_combo.currentText()
+            device = self.analysis_device_combo.currentText()
+            top_k = int(self.top_k_spin.value())
+            profiles = available_threshold_profiles()
+        except Exception as exc:
+            self.append_log(f"Cannot compare profiles: {exc}")
+            return
+
+        self.record_button.setEnabled(False)
+        self.analyze_button.setEnabled(False)
+        self.compare_button.setEnabled(False)
+        self.save_tag_button.setEnabled(False)
+        self.refresh_button.setEnabled(False)
+        self.status_label.setText("Comparing...")
+        self.append_log(f"Comparing profiles for {audio_path}")
+
+        self._thread = QtCore.QThread(self)
+        self._worker = ProfileCompareWorker(
+            audio_path=audio_path,
+            teacher_model=teacher_model,
+            device=device,
+            top_k=top_k,
+            peak_summary=self._last_peak_summary if self._last_capture_path == audio_path else None,
+            profiles=profiles,
+        )
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.finished.connect(self._profile_comparison_finished)
+        self._worker.failed.connect(self._profile_comparison_failed)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.failed.connect(self._thread.quit)
+        self._thread.finished.connect(self._cleanup_worker)
+        self._thread.start()
+
+    @QtCore.pyqtSlot(str, str, str)
+    def _profile_comparison_finished(self, path, summary, result_path):
+        self._last_capture_path = Path(path)
+        self.status_label.setText("Compared")
+        self.append_log(f"Profile comparison complete: {path}")
+        self.append_log(f"Profile comparison saved: {result_path}")
+        self.append_log(summary)
+
+    @QtCore.pyqtSlot(str)
+    def _profile_comparison_failed(self, message):
+        self.status_label.setText("Comparison failed")
+        self.append_log(f"Profile comparison failed: {message}")
+
     def save_tag(self):
         try:
             audio_path = self.analysis_path()
@@ -737,6 +983,7 @@ class CaptureWindow(QtWidgets.QWidget):
     def _cleanup_worker(self):
         self.record_button.setEnabled(True)
         self.analyze_button.setEnabled(True)
+        self.compare_button.setEnabled(True)
         self.save_tag_button.setEnabled(True)
         self.refresh_button.setEnabled(True)
         if self._worker is not None:

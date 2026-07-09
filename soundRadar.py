@@ -2,8 +2,10 @@ import concurrent.futures
 import ctypes
 import ctypes.util
 from dataclasses import dataclass
+import json
 import math
 import os
+from pathlib import Path
 import queue
 import random
 import sys
@@ -101,7 +103,150 @@ DIRECTION_EVENT_MAX_ICONS_PER_DIRECTION = 2
 GUNSHOT_SPATIAL_MAX_DIRECTIONS = 2
 GUNSHOT_GLOBAL_COOLDOWN = 0.18
 
+ROLLING_CAPTURE_ENABLED = True
+ROLLING_CAPTURE_SECONDS = 5.0
+ROLLING_CAPTURE_DIR = str(Path.home() / "SoundRadarSamples" / "rolling")
+ROLLING_CAPTURE_TRIGGER_PATH = "/tmp/soundradar-save-rolling"
+
+RUNTIME_CONFIG_FILENAME = "soundradar.local.json"
+RUNTIME_CONFIG_ENV = "SOUNDRADAR_CONFIG"
 THRESHOLD_PROFILE_ENV = "SOUNDRADAR_THRESHOLD_PROFILE"
+RUNTIME_CONFIG_KEYS = frozenset(
+    (
+        "schema_version",
+        "enable_direction_events",
+        "teacher_model",
+        "model_id",
+        "device",
+        "dtype",
+        "attn_implementation",
+        "compile_model",
+        "top_k",
+        "window_seconds",
+        "interval_seconds",
+        "warmup",
+        "threshold_profile",
+        "rolling_capture_enabled",
+        "rolling_capture_seconds",
+        "rolling_capture_dir",
+        "rolling_capture_trigger_path",
+    )
+)
+
+
+def default_runtime_config_path():
+    return Path(__file__).with_name(RUNTIME_CONFIG_FILENAME)
+
+
+def runtime_config_path(environ=None):
+    environ = os.environ if environ is None else environ
+    path = environ.get(RUNTIME_CONFIG_ENV)
+    return Path(path).expanduser() if path else default_runtime_config_path()
+
+
+def load_runtime_config(path=None, environ=None):
+    path = runtime_config_path(environ) if path is None else Path(path).expanduser()
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as config_file:
+        data = json.load(config_file)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    unknown = sorted(set(data) - RUNTIME_CONFIG_KEYS)
+    if unknown:
+        raise ValueError(f"unknown runtime config keys: {', '.join(unknown)}")
+    return dict(data)
+
+
+def _config_bool(value, key):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("1", "true", "yes", "on"):
+            return True
+        if normalized in ("0", "false", "no", "off"):
+            return False
+    raise ValueError(f"{key} must be a boolean")
+
+
+def _config_int(value, key):
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be an integer") from exc
+
+
+def _config_float(value, key):
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a number") from exc
+
+
+def _config_optional_str(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _config_compile_model(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("1", "true", "yes", "on"):
+            return True
+        if normalized in ("0", "false", "no", "off", ""):
+            return False
+        return value.strip()
+    raise ValueError("compile_model must be a boolean or torch.compile mode string")
+
+
+def apply_runtime_config(config):
+    global ENABLE_AST_DIRECTION_EVENTS, AST_DIRECTION_EVENT_DEVICE, AST_DIRECTION_EVENT_DTYPE
+    global AST_DIRECTION_EVENT_ATTN_IMPLEMENTATION, AST_DIRECTION_EVENT_COMPILE
+    global AST_DIRECTION_EVENT_TEACHER_MODEL, AST_DIRECTION_EVENT_MODEL_ID, AST_DIRECTION_EVENT_TOP_K
+    global AST_DIRECTION_EVENT_WINDOW_SECONDS, AST_DIRECTION_EVENT_INTERVAL, AST_DIRECTION_EVENT_WARMUP
+    global ROLLING_CAPTURE_ENABLED, ROLLING_CAPTURE_SECONDS, ROLLING_CAPTURE_DIR, ROLLING_CAPTURE_TRIGGER_PATH
+
+    config = dict(config or {})
+    unknown = sorted(set(config) - RUNTIME_CONFIG_KEYS)
+    if unknown:
+        raise ValueError(f"unknown runtime config keys: {', '.join(unknown)}")
+
+    if "enable_direction_events" in config:
+        ENABLE_AST_DIRECTION_EVENTS = _config_bool(config["enable_direction_events"], "enable_direction_events")
+    if "teacher_model" in config:
+        AST_DIRECTION_EVENT_TEACHER_MODEL = str(config["teacher_model"])
+    if "model_id" in config:
+        AST_DIRECTION_EVENT_MODEL_ID = _config_optional_str(config["model_id"])
+    if "device" in config:
+        AST_DIRECTION_EVENT_DEVICE = str(config["device"])
+    if "dtype" in config:
+        AST_DIRECTION_EVENT_DTYPE = str(config["dtype"])
+    if "attn_implementation" in config:
+        AST_DIRECTION_EVENT_ATTN_IMPLEMENTATION = _config_optional_str(config["attn_implementation"])
+    if "compile_model" in config:
+        AST_DIRECTION_EVENT_COMPILE = _config_compile_model(config["compile_model"])
+    if "top_k" in config:
+        AST_DIRECTION_EVENT_TOP_K = _config_int(config["top_k"], "top_k")
+    if "window_seconds" in config:
+        AST_DIRECTION_EVENT_WINDOW_SECONDS = _config_float(config["window_seconds"], "window_seconds")
+    if "interval_seconds" in config:
+        AST_DIRECTION_EVENT_INTERVAL = _config_float(config["interval_seconds"], "interval_seconds")
+    if "warmup" in config:
+        AST_DIRECTION_EVENT_WARMUP = _config_bool(config["warmup"], "warmup")
+    if "rolling_capture_enabled" in config:
+        ROLLING_CAPTURE_ENABLED = _config_bool(config["rolling_capture_enabled"], "rolling_capture_enabled")
+    if "rolling_capture_seconds" in config:
+        ROLLING_CAPTURE_SECONDS = _config_float(config["rolling_capture_seconds"], "rolling_capture_seconds")
+    if "rolling_capture_dir" in config:
+        ROLLING_CAPTURE_DIR = str(Path(str(config["rolling_capture_dir"])).expanduser())
+    if "rolling_capture_trigger_path" in config:
+        ROLLING_CAPTURE_TRIGGER_PATH = str(Path(str(config["rolling_capture_trigger_path"])).expanduser())
+    return config
 
 
 @dataclass(frozen=True)
@@ -195,9 +340,11 @@ def threshold_profile(name=None):
         raise ValueError(f"unknown threshold profile: {name}; choose one of: {choices}") from exc
 
 
-def parse_threshold_profile_args(argv, environ=None):
+def parse_threshold_profile_args(argv, environ=None, runtime_config=None):
     environ = os.environ if environ is None else environ
-    profile_name = environ.get(THRESHOLD_PROFILE_ENV, "default")
+    runtime_config = runtime_config or {}
+    profile_name = runtime_config.get("threshold_profile", "default")
+    profile_name = environ.get(THRESHOLD_PROFILE_ENV, profile_name)
     cleaned = []
     args = list(argv)
     index = 0
@@ -324,6 +471,57 @@ class SoundPulse:
 class TimedAudioBlock:
     samples: object
     captured_at: float
+
+
+@dataclass(frozen=True)
+class RollingCaptureSnapshot:
+    audio: object
+    sample_rate: int
+    channel_count: int
+    start_capture_time: float | None = None
+    end_capture_time: float | None = None
+
+
+class RollingAudioCapture:
+    def __init__(self, sample_rate, channel_count, seconds=ROLLING_CAPTURE_SECONDS):
+        self.sample_rate = int(sample_rate)
+        self.channel_count = int(channel_count)
+        self.seconds = float(seconds)
+        self.max_samples = max(1, int(round(self.sample_rate * self.seconds)))
+        self._audio = np.zeros((0, self.channel_count), dtype=np.float32)
+        self.end_capture_time = None
+
+    def append_blocks(self, blocks, capture_time=None):
+        prepared = []
+        for block in blocks:
+            audio = np.asarray(block, dtype=np.float32)
+            if audio.ndim == 1:
+                audio = audio[:, None]
+            if audio.ndim != 2 or audio.shape[0] == 0:
+                continue
+            if audio.shape[1] < self.channel_count:
+                padded = np.zeros((audio.shape[0], self.channel_count), dtype=np.float32)
+                padded[:, : audio.shape[1]] = audio
+                audio = padded
+            prepared.append(audio[:, : self.channel_count])
+        if prepared:
+            self._audio = np.concatenate([self._audio, *prepared], axis=0)[-self.max_samples :]
+            if capture_time is not None:
+                self.end_capture_time = float(capture_time)
+
+    def snapshot(self):
+        audio = np.array(self._audio, copy=True)
+        if self.end_capture_time is None:
+            start_capture_time = None
+        else:
+            start_capture_time = self.end_capture_time - (audio.shape[0] / float(self.sample_rate))
+        return RollingCaptureSnapshot(
+            audio=audio,
+            sample_rate=self.sample_rate,
+            channel_count=self.channel_count,
+            start_capture_time=start_capture_time,
+            end_capture_time=self.end_capture_time,
+        )
 
 
 @dataclass(frozen=True)
@@ -1622,6 +1820,8 @@ class ParentWidget(QtWidgets.QWidget):
         self._last_global_event_times = {}
         self._previous_direction_levels = np.zeros(RADAR_SECTORS)
         self.direction_event_runtime = None
+        self.rolling_capture = None
+        self.threshold_profile_name = "default"
         self.latest_direction_event_prediction = None
         self.latest_direction_event_display_debug = None
         self.radar_latency_ms = None
@@ -1712,6 +1912,94 @@ def audio_callback(indata, frames, callback_time, status):
     if status:
         print(status, file=sys.stderr)
     q.put(TimedAudioBlock(indata.copy(), captured_at=time.perf_counter()))
+
+
+def rolling_capture_output_path(directory=None, now=None):
+    timestamp = time.time() if now is None else float(now)
+    base = Path(directory or ROLLING_CAPTURE_DIR).expanduser()
+    local = time.localtime(timestamp)
+    millis = int((timestamp - int(timestamp)) * 1000)
+    return base / f"soundradar-rolling-{time.strftime('%Y%m%d-%H%M%S', local)}-{millis:03d}.wav"
+
+
+def rolling_capture_metadata_path(audio_path):
+    return Path(audio_path).with_suffix(".json")
+
+
+def rolling_capture_metadata_payload(
+    snapshot,
+    *,
+    audio_path,
+    saved_at=None,
+    prediction=None,
+    display_debug=None,
+    threshold_profile_name=None,
+):
+    from sound_model.capture_direction_sample import capture_sanity_lines, channel_peak_summary
+
+    audio = np.asarray(snapshot.audio, dtype=np.float32)
+    saved_at = time.time() if saved_at is None else float(saved_at)
+    payload = {
+        "schema_version": 1,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(saved_at)),
+        "audio_path": str(Path(audio_path)),
+        "sample_rate": int(snapshot.sample_rate),
+        "channel_count": int(snapshot.channel_count),
+        "duration_seconds": float(audio.shape[0]) / float(snapshot.sample_rate) if snapshot.sample_rate else 0.0,
+        "start_capture_time": snapshot.start_capture_time,
+        "end_capture_time": snapshot.end_capture_time,
+        "threshold_profile": threshold_profile_name,
+        "peak_summary": channel_peak_summary(audio),
+        "sanity_lines": capture_sanity_lines(audio, expected_channels=snapshot.channel_count),
+    }
+    if prediction is not None:
+        payload["prediction"] = prediction.to_jsonable() if hasattr(prediction, "to_jsonable") else None
+        payload["hud_summary_lines"] = direction_event_debug_lines(
+            prediction,
+            threshold=AST_DIRECTION_EVENT_THRESHOLD,
+            display_debug=display_debug,
+        )
+    return payload
+
+
+def write_rolling_capture_snapshot(
+    snapshot,
+    *,
+    directory=None,
+    now=None,
+    prediction=None,
+    display_debug=None,
+    threshold_profile_name=None,
+):
+    from sound_model.audio_features import write_wav
+
+    audio_path = rolling_capture_output_path(directory, now=now)
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    write_wav(audio_path, np.asarray(snapshot.audio, dtype=np.float32), snapshot.sample_rate)
+    metadata = rolling_capture_metadata_payload(
+        snapshot,
+        audio_path=audio_path,
+        saved_at=now,
+        prediction=prediction,
+        display_debug=display_debug,
+        threshold_profile_name=threshold_profile_name,
+    )
+    metadata_path = rolling_capture_metadata_path(audio_path)
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+    return audio_path, metadata_path
+
+
+def consume_rolling_capture_trigger(path=None):
+    path = Path(path or ROLLING_CAPTURE_TRIGGER_PATH).expanduser()
+    if not str(path):
+        return False
+    if not path.exists():
+        return False
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return True
 
 
 class DirectionEventRuntime:
@@ -2067,6 +2355,34 @@ def update_direction_event_runtime(radarObject, audio_blocks, now, capture_time=
     return prediction
 
 
+def update_rolling_capture(radarObject, audio_blocks, capture_time=None):
+    rolling_capture = getattr(radarObject, "rolling_capture", None)
+    if rolling_capture is None:
+        return
+    rolling_capture.append_blocks(audio_blocks, capture_time=capture_time)
+
+
+def maybe_save_rolling_capture(radarObject, now):
+    rolling_capture = getattr(radarObject, "rolling_capture", None)
+    if rolling_capture is None or not consume_rolling_capture_trigger():
+        return None
+    snapshot = rolling_capture.snapshot()
+    if np.asarray(snapshot.audio).size == 0:
+        print("Rolling capture trigger ignored: no audio buffered yet.", file=sys.stderr)
+        return None
+    audio_path, metadata_path = write_rolling_capture_snapshot(
+        snapshot,
+        directory=ROLLING_CAPTURE_DIR,
+        now=now,
+        prediction=getattr(radarObject, "latest_direction_event_prediction", None),
+        display_debug=getattr(radarObject, "latest_direction_event_display_debug", None),
+        threshold_profile_name=getattr(radarObject, "threshold_profile_name", None),
+    )
+    print(f"Rolling capture saved: {audio_path}")
+    print(f"Rolling capture metadata: {metadata_path}")
+    return audio_path, metadata_path
+
+
 def updateRadar(radarObject):
     while True:
         time.sleep(refreshtime)
@@ -2076,6 +2392,7 @@ def updateRadar(radarObject):
         now = time.time()
         if latest_capture_time is not None:
             radarObject.radar_latency_ms = max(0.0, (time.perf_counter() - latest_capture_time) * 1000.0)
+        update_rolling_capture(radarObject, audio_blocks, latest_capture_time)
         event_prediction = update_direction_event_runtime(radarObject, audio_blocks, now, latest_capture_time)
 
         if DEBUG:
@@ -2111,6 +2428,7 @@ def updateRadar(radarObject):
             radarObject.add_pulses(event_pulses)
             radarObject.prune_pulses(now)
             radarObject._previous_direction_levels = np.array(direction_levels, copy=True)
+        maybe_save_rolling_capture(radarObject, now)
 
         for position, frame in radarObject.popframes.items():
             update_sector_state(frame, position, direction_levels[position], now)
@@ -2233,12 +2551,27 @@ def configure_direction_event_runtime(window, sample_rate, channel_count, channe
     return True
 
 
+def configure_rolling_capture(window, sample_rate, channel_count):
+    if not ROLLING_CAPTURE_ENABLED or ROLLING_CAPTURE_SECONDS <= 0:
+        window.rolling_capture = None
+        return False
+    window.rolling_capture = RollingAudioCapture(sample_rate, channel_count, ROLLING_CAPTURE_SECONDS)
+    print(
+        f"Rolling capture enabled ({ROLLING_CAPTURE_SECONDS:.1f}s). "
+        f"Create {ROLLING_CAPTURE_TRIGGER_PATH} to save the latest buffer to {ROLLING_CAPTURE_DIR}."
+    )
+    return True
+
+
 mapping, channel_mode = build_channel_mapping(n_chans)
 
 
 def main(argv=None):
     argv = list(sys.argv if argv is None else argv)
-    qt_argv, threshold_profile_name = parse_threshold_profile_args(argv)
+    config_path = runtime_config_path()
+    runtime_config = load_runtime_config(config_path)
+    apply_runtime_config(runtime_config)
+    qt_argv, threshold_profile_name = parse_threshold_profile_args(argv, runtime_config=runtime_config)
     active_profile = apply_threshold_profile(threshold_profile_name)
     app = QtWidgets.QApplication(qt_argv)
     window = create_main_window()
@@ -2246,6 +2579,10 @@ def main(argv=None):
     assert device_info is not None
     configure_audio_mapping(device_info)
     configure_direction_event_runtime(window, device_info.get("default_samplerate", 44_100), n_chans, mapping)
+    configure_rolling_capture(window, device_info.get("default_samplerate", 44_100), n_chans)
+    window.threshold_profile_name = active_profile.name
+    if runtime_config:
+        print(f"Runtime config: {config_path}")
     print(f"Threshold profile: {active_profile.name}")
     print("Make sure system Sound Output is set to BlackHole/Loopback/VB-Cable or a Multi-Output device that includes it.")
 
