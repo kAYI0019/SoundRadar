@@ -900,6 +900,11 @@ class SoundRadarRuntimeConfigTests(unittest.TestCase):
             "ROLLING_CAPTURE_SECONDS": soundRadar.ROLLING_CAPTURE_SECONDS,
             "ROLLING_CAPTURE_DIR": soundRadar.ROLLING_CAPTURE_DIR,
             "ROLLING_CAPTURE_TRIGGER_PATH": soundRadar.ROLLING_CAPTURE_TRIGGER_PATH,
+            "EVENT_ICON_SHOW_LABELS": soundRadar.EVENT_ICON_SHOW_LABELS,
+            "EVENT_ICON_SIZE_SCALE": soundRadar.EVENT_ICON_SIZE_SCALE,
+            "EVENT_ICON_ALPHA_SCALE": soundRadar.EVENT_ICON_ALPHA_SCALE,
+            "DIRECTION_EVENT_SMOOTHING_ENABLED": soundRadar.DIRECTION_EVENT_SMOOTHING_ENABLED,
+            "DIRECTION_EVENT_SMOOTHING_WINDOW": soundRadar.DIRECTION_EVENT_SMOOTHING_WINDOW,
         }
 
     def tearDown(self):
@@ -936,6 +941,11 @@ class SoundRadarRuntimeConfigTests(unittest.TestCase):
                 "rolling_capture_seconds": 3.5,
                 "rolling_capture_dir": "/tmp/soundradar-roll",
                 "rolling_capture_trigger_path": "/tmp/soundradar-trigger",
+                "event_icon_labels": True,
+                "event_icon_scale": 0.8,
+                "event_icon_opacity": 0.6,
+                "event_smoothing_enabled": False,
+                "event_smoothing_window": 2,
             }
         )
 
@@ -954,6 +964,11 @@ class SoundRadarRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(soundRadar.ROLLING_CAPTURE_SECONDS, 3.5)
         self.assertEqual(soundRadar.ROLLING_CAPTURE_DIR, "/tmp/soundradar-roll")
         self.assertEqual(soundRadar.ROLLING_CAPTURE_TRIGGER_PATH, "/tmp/soundradar-trigger")
+        self.assertTrue(soundRadar.EVENT_ICON_SHOW_LABELS)
+        self.assertEqual(soundRadar.EVENT_ICON_SIZE_SCALE, 0.8)
+        self.assertEqual(soundRadar.EVENT_ICON_ALPHA_SCALE, 0.6)
+        self.assertFalse(soundRadar.DIRECTION_EVENT_SMOOTHING_ENABLED)
+        self.assertEqual(soundRadar.DIRECTION_EVENT_SMOOTHING_WINDOW, 2)
 
     def test_parse_threshold_profile_args_uses_config_then_env_then_cli(self):
         qt_args, env_profile = soundRadar.parse_threshold_profile_args(
@@ -1008,6 +1023,106 @@ class SoundRadarRollingCaptureTests(unittest.TestCase):
         self.assertEqual(metadata["threshold_profile"], "default")
         self.assertIn("ch0=0.500", metadata["peak_summary"])
         self.assertTrue(any("stereo/downmixed" in line for line in metadata["sanity_lines"]))
+
+    def test_write_and_consume_rolling_capture_trigger(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/trigger"
+
+            written = soundRadar.write_rolling_capture_trigger(path)
+            consumed = soundRadar.consume_rolling_capture_trigger(path)
+
+        self.assertEqual(str(written), path)
+        self.assertTrue(consumed)
+
+
+class SoundRadarEventSmoothingTests(unittest.TestCase):
+    def tearDown(self):
+        soundRadar.apply_runtime_config(
+            {
+                "event_smoothing_enabled": True,
+                "event_smoothing_window": 3,
+                "event_icon_labels": False,
+                "event_icon_scale": 1.0,
+                "event_icon_opacity": 1.0,
+            }
+        )
+
+    def test_smooth_direction_event_predictions_weights_recent_scores(self):
+        first = SimpleNamespace(
+            sample_rate=48000,
+            direction_event_scores={"right": {"gunshot": 0.90, "vehicle": 0.0, "footstep": 0.0, "explosion": 0.0}},
+            active_events_by_direction={"right": ["gunshot"]},
+            top_labels_by_direction={"right": [{"label": "Gunshot", "score": 0.90}]},
+            source_path="<live>",
+        )
+        second = SimpleNamespace(
+            sample_rate=48000,
+            direction_event_scores={"right": {"gunshot": 0.0, "vehicle": 0.30, "footstep": 0.0, "explosion": 0.0}},
+            active_events_by_direction={"right": ["vehicle"]},
+            top_labels_by_direction={"right": [{"label": "Vehicle", "score": 0.30}]},
+            source_path="<live>",
+        )
+
+        smoothed = soundRadar.smooth_direction_event_predictions([first, second], window=2)
+
+        self.assertAlmostEqual(smoothed.direction_event_scores["right"]["gunshot"], 0.30)
+        self.assertAlmostEqual(smoothed.direction_event_scores["right"]["vehicle"], 0.20)
+        self.assertEqual(smoothed.active_events_by_direction["right"], ["gunshot", "vehicle"])
+        self.assertEqual(smoothed.top_labels_by_direction["right"][0]["label"], "Vehicle")
+
+    def test_update_direction_event_runtime_returns_smoothed_prediction(self):
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                class DoneFuture:
+                    def done(self):
+                        return True
+
+                    def result(self):
+                        return fn(*args)
+
+                return DoneFuture()
+
+        predictions = [
+            SimpleNamespace(
+                sample_rate=10,
+                direction_event_scores={"right": {"gunshot": 0.90, "vehicle": 0.0, "footstep": 0.0, "explosion": 0.0}},
+                active_events_by_direction={"right": ["gunshot"]},
+                top_labels_by_direction={},
+            ),
+            SimpleNamespace(
+                sample_rate=10,
+                direction_event_scores={"right": {"gunshot": 0.0, "vehicle": 0.30, "footstep": 0.0, "explosion": 0.0}},
+                active_events_by_direction={"right": ["vehicle"]},
+                top_labels_by_direction={},
+            ),
+        ]
+
+        def score_fn(audio, sample_rate, top_k, source_path):
+            _ = audio, sample_rate, top_k, source_path
+            return predictions.pop(0)
+
+        soundRadar.apply_runtime_config({"event_smoothing_enabled": True, "event_smoothing_window": 2})
+        radar = SimpleNamespace(
+            direction_event_runtime=soundRadar.DirectionEventRuntime(
+                sample_rate=10,
+                channel_count=2,
+                window_seconds=0.1,
+                interval_seconds=0.0,
+                executor=ImmediateExecutor(),
+                score_fn=score_fn,
+            ),
+            _direction_event_prediction_history=[],
+            ast_latency_ms=None,
+            latest_direction_event_prediction=None,
+        )
+        blocks = [soundRadar.np.ones((1, 2), dtype=soundRadar.np.float32)]
+
+        first = soundRadar.update_direction_event_runtime(radar, blocks, now=0.0, capture_time=0.0)
+        second = soundRadar.update_direction_event_runtime(radar, blocks, now=0.1, capture_time=0.1)
+
+        self.assertAlmostEqual(first.direction_event_scores["right"]["gunshot"], 0.90)
+        self.assertAlmostEqual(second.direction_event_scores["right"]["gunshot"], 0.30)
+        self.assertIs(radar.latest_direction_event_prediction, second)
 
 
 class SoundRadarWindowTests(unittest.TestCase):

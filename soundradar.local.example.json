@@ -11,5 +11,10 @@
   "rolling_capture_enabled": true,
   "rolling_capture_seconds": 5.0,
   "rolling_capture_dir": "~/SoundRadarSamples/rolling",
-  "rolling_capture_trigger_path": "/tmp/soundradar-save-rolling"
+  "rolling_capture_trigger_path": "/tmp/soundradar-save-rolling",
+  "event_icon_labels": false,
+  "event_icon_scale": 1.0,
+  "event_icon_opacity": 1.0,
+  "event_smoothing_enabled": true,
+  "event_smoothing_window": 3
 }

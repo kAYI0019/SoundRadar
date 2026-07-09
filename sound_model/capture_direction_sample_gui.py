@@ -104,6 +104,14 @@ def available_threshold_profiles() -> tuple[str, ...]:
         return ("default",)
 
 
+def trigger_rolling_capture(path: str | Path | None = None) -> Path:
+    import soundRadar
+
+    if path is None:
+        soundRadar.apply_runtime_config(soundRadar.load_runtime_config())
+    return soundRadar.write_rolling_capture_trigger(path)
+
+
 def compact_score(score) -> str:
     return f"{max(0.0, min(1.0, float(score))):.2f}".lstrip("0")
 
@@ -600,6 +608,7 @@ class CaptureWindow(QtWidgets.QWidget):
         self.browse_button = QtWidgets.QPushButton("Browse")
         self.record_button = QtWidgets.QPushButton("Record")
         self.record_button.setDefault(True)
+        self.save_rolling_button = QtWidgets.QPushButton("Save Last 5s")
         self.analyze_button = QtWidgets.QPushButton("Analyze")
         self.compare_button = QtWidgets.QPushButton("Compare Profiles")
 
@@ -689,6 +698,7 @@ class CaptureWindow(QtWidgets.QWidget):
 
         action_row = QtWidgets.QHBoxLayout()
         action_row.addWidget(self.status_label, 1)
+        action_row.addWidget(self.save_rolling_button)
         action_row.addWidget(self.record_button)
         layout.addLayout(action_row)
         layout.addWidget(self.log)
@@ -709,6 +719,7 @@ class CaptureWindow(QtWidgets.QWidget):
         self.sample_rate_auto.toggled.connect(self._sync_device_defaults)
         self.browse_button.clicked.connect(self.browse_output)
         self.record_button.clicked.connect(self.start_recording)
+        self.save_rolling_button.clicked.connect(self.request_rolling_capture)
         self.analyze_button.clicked.connect(self.start_analysis)
         self.compare_button.clicked.connect(self.start_profile_comparison)
         self.library_browse_button.clicked.connect(self.browse_library)
@@ -787,6 +798,16 @@ class CaptureWindow(QtWidgets.QWidget):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Library", self.library_edit.text(), "CSV files (*.csv)")
         if path:
             self.library_edit.setText(path)
+
+    def request_rolling_capture(self):
+        try:
+            path = trigger_rolling_capture()
+        except Exception as exc:
+            self.status_label.setText("Rolling trigger failed")
+            self.append_log(f"Cannot request rolling capture: {exc}")
+            return
+        self.status_label.setText("Rolling requested")
+        self.append_log(f"Rolling capture requested: {path}")
 
     def start_recording(self):
         if self._thread is not None:

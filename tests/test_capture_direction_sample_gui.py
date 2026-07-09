@@ -22,6 +22,7 @@ from sound_model.capture_direction_sample_gui import (
     prediction_result_payload,
     prediction_summary_text,
     sample_library_record,
+    trigger_rolling_capture,
     write_profile_comparison_json,
     write_prediction_result_json,
 )
@@ -56,6 +57,14 @@ class CaptureDirectionSampleGuiTests(unittest.TestCase):
         self.assertIn("--teacher-model ast", command)
         self.assertIn("--device auto", command)
         self.assertIn("--top-k 5", command)
+
+    def test_trigger_rolling_capture_writes_trigger_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/save-now"
+            written = trigger_rolling_capture(path)
+
+            self.assertEqual(str(written), path)
+            self.assertTrue(written.exists())
 
     def test_available_threshold_profiles_exposes_soundradar_profiles(self):
         self.assertIn("quiet", available_threshold_profiles())

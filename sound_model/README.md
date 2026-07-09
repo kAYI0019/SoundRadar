@@ -141,7 +141,9 @@ when an 8+ channel recording only has stereo-like active channels. Use
 **Compare Profiles** to write `*.profile-comparison.json` from the same teacher
 prediction for `default`, `quiet`, `aggressive`, and `debug`. Use the GUI
 **Tag** row to append reviewed samples to a CSV library with `gunshot`,
-`vehicle`, `footstep`, `unknown`, or `bad sample` labels. CLI equivalent:
+`vehicle`, `footstep`, `unknown`, or `bad sample` labels. If the live overlay is
+running, **Save Last 5s** creates the rolling-capture trigger file for the
+overlay. CLI equivalent:
 
 ```sh
 .venv/bin/python -m sound_model.capture_direction_sample \
@@ -174,9 +176,10 @@ After collecting tagged samples, re-evaluate the library across profiles:
   --top-k 5
 ```
 
-This writes `sample_library.evaluation.csv` by default, with one row per
-sample/profile pair. Use it to compare missed `gunshot`/`vehicle`/`footstep`
-tags, duplicate display events, and gunshot direction suppression.
+This writes `sample_library.evaluation.csv` plus a profile summary CSV by
+default. Use the per-sample rows and summary counts to compare missed
+`gunshot`/`vehicle`/`footstep` tags, duplicate display events, unknown/bad
+samples that still show icons, and gunshot direction suppression.
 
 ## Full 7-direction benchmark
 

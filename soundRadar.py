@@ -97,6 +97,8 @@ DIRECTION_EVENT_SECONDARY_DISPLAY_THRESHOLDS = {
 }
 DIRECTION_EVENT_GUNSHOT_BIAS_MARGIN = 0.25
 DIRECTION_EVENT_MAX_ICONS_PER_DIRECTION = 2
+DIRECTION_EVENT_SMOOTHING_ENABLED = True
+DIRECTION_EVENT_SMOOTHING_WINDOW = 3
 
 # Gunshot direction tuning: keep detection permissive, then suppress spatial
 # bleed and rapid repeats at display time so distant shots are still visible.
@@ -130,6 +132,11 @@ RUNTIME_CONFIG_KEYS = frozenset(
         "rolling_capture_seconds",
         "rolling_capture_dir",
         "rolling_capture_trigger_path",
+        "event_icon_labels",
+        "event_icon_scale",
+        "event_icon_opacity",
+        "event_smoothing_enabled",
+        "event_smoothing_window",
     )
 )
 
@@ -184,6 +191,20 @@ def _config_float(value, key):
         raise ValueError(f"{key} must be a number") from exc
 
 
+def _config_positive_float(value, key):
+    parsed = _config_float(value, key)
+    if parsed <= 0:
+        raise ValueError(f"{key} must be positive")
+    return parsed
+
+
+def _config_positive_int(value, key):
+    parsed = _config_int(value, key)
+    if parsed <= 0:
+        raise ValueError(f"{key} must be positive")
+    return parsed
+
+
 def _config_optional_str(value):
     if value is None:
         return None
@@ -210,6 +231,8 @@ def apply_runtime_config(config):
     global AST_DIRECTION_EVENT_TEACHER_MODEL, AST_DIRECTION_EVENT_MODEL_ID, AST_DIRECTION_EVENT_TOP_K
     global AST_DIRECTION_EVENT_WINDOW_SECONDS, AST_DIRECTION_EVENT_INTERVAL, AST_DIRECTION_EVENT_WARMUP
     global ROLLING_CAPTURE_ENABLED, ROLLING_CAPTURE_SECONDS, ROLLING_CAPTURE_DIR, ROLLING_CAPTURE_TRIGGER_PATH
+    global EVENT_ICON_SHOW_LABELS, EVENT_ICON_SIZE_SCALE, EVENT_ICON_ALPHA_SCALE
+    global DIRECTION_EVENT_SMOOTHING_ENABLED, DIRECTION_EVENT_SMOOTHING_WINDOW
 
     config = dict(config or {})
     unknown = sorted(set(config) - RUNTIME_CONFIG_KEYS)
@@ -246,6 +269,16 @@ def apply_runtime_config(config):
         ROLLING_CAPTURE_DIR = str(Path(str(config["rolling_capture_dir"])).expanduser())
     if "rolling_capture_trigger_path" in config:
         ROLLING_CAPTURE_TRIGGER_PATH = str(Path(str(config["rolling_capture_trigger_path"])).expanduser())
+    if "event_icon_labels" in config:
+        EVENT_ICON_SHOW_LABELS = _config_bool(config["event_icon_labels"], "event_icon_labels")
+    if "event_icon_scale" in config:
+        EVENT_ICON_SIZE_SCALE = _config_positive_float(config["event_icon_scale"], "event_icon_scale")
+    if "event_icon_opacity" in config:
+        EVENT_ICON_ALPHA_SCALE = _config_positive_float(config["event_icon_opacity"], "event_icon_opacity")
+    if "event_smoothing_enabled" in config:
+        DIRECTION_EVENT_SMOOTHING_ENABLED = _config_bool(config["event_smoothing_enabled"], "event_smoothing_enabled")
+    if "event_smoothing_window" in config:
+        DIRECTION_EVENT_SMOOTHING_WINDOW = _config_positive_int(config["event_smoothing_window"], "event_smoothing_window")
     return config
 
 
@@ -418,6 +451,8 @@ EVENT_ICON_MIN_SIZE_RATIO = 0.026
 EVENT_ICON_MAX_SIZE_RATIO = 0.044
 EVENT_ICON_POP_AGE_RATIO = 0.28
 EVENT_ICON_POP_SCALE = 0.08
+EVENT_ICON_SIZE_SCALE = 1.0
+EVENT_ICON_ALPHA_SCALE = 1.0
 EVENT_ICON_SHOW_LABELS = False
 EVENT_ICON_RGBA = (238, 236, 220, 205)
 EVENT_ICON_SHADOW_RGBA = (0, 0, 0, 120)
@@ -549,6 +584,28 @@ class DirectionEventPulseDebug:
     gunshot_emitted_directions: tuple
     gunshot_global_cooldown_blocked_directions: tuple
     gunshot_sector_cooldown_blocked_directions: tuple
+
+
+@dataclass
+class SmoothedDirectionEventPrediction:
+    sample_rate: int
+    direction_event_scores: dict
+    active_events_by_direction: dict
+    top_labels_by_direction: dict
+    source_path: str | None = None
+    mode: str = "smoothed direction-event inference"
+
+    def to_jsonable(self):
+        return {
+            "source_path": self.source_path,
+            "sample_rate": self.sample_rate,
+            "mode": self.mode,
+            "directions": list(DIRECTION_EVENT_SECTORS),
+            "classes": sorted({event for scores in self.direction_event_scores.values() for event in scores}),
+            "direction_event_scores": self.direction_event_scores,
+            "active_events_by_direction": self.active_events_by_direction,
+            "top_labels_by_direction": self.top_labels_by_direction,
+        }
 
 
 def pulse_age_ratio(pulse, now):
@@ -825,6 +882,54 @@ def suppress_displayed_events_for_direction(direction, events, allowed_gunshot_d
     return [(event_name, score) for event_name, score in events if event_name != "gunshot"]
 
 
+def _prediction_event_names(predictions):
+    names = set(("background", *DIRECTION_EVENT_PRIORITY))
+    for prediction in predictions:
+        scores_by_direction = getattr(prediction, "direction_event_scores", {}) or {}
+        for scores in scores_by_direction.values():
+            names.update((scores or {}).keys())
+    return tuple(sorted(names))
+
+
+def smooth_direction_event_predictions(predictions, *, window=DIRECTION_EVENT_SMOOTHING_WINDOW):
+    valid = [prediction for prediction in predictions if prediction is not None]
+    if not valid:
+        return None
+    window = max(1, int(window))
+    valid = valid[-window:]
+    if len(valid) == 1 or window <= 1:
+        return valid[-1]
+
+    latest = valid[-1]
+    event_names = _prediction_event_names(valid)
+    weights = np.arange(1, len(valid) + 1, dtype=np.float32)
+    weight_sum = float(np.sum(weights))
+    smoothed_scores = {}
+    smoothed_active = {}
+
+    for direction in DIRECTION_EVENT_SECTORS:
+        direction_scores = {}
+        active_union = set()
+        for prediction in valid:
+            active_union.update((getattr(prediction, "active_events_by_direction", {}) or {}).get(direction, ()) or ())
+        for event_name in event_names:
+            weighted_score = 0.0
+            for weight, prediction in zip(weights, valid):
+                scores = (getattr(prediction, "direction_event_scores", {}) or {}).get(direction, {}) or {}
+                weighted_score += float(weight) * clamp(float(scores.get(event_name, 0.0)))
+            direction_scores[event_name] = weighted_score / weight_sum
+        smoothed_scores[direction] = direction_scores
+        smoothed_active[direction] = [event_name for event_name in DIRECTION_EVENT_PRIORITY if event_name in active_union]
+
+    return SmoothedDirectionEventPrediction(
+        sample_rate=int(getattr(latest, "sample_rate", 0) or 0),
+        direction_event_scores=smoothed_scores,
+        active_events_by_direction=smoothed_active,
+        top_labels_by_direction=dict(getattr(latest, "top_labels_by_direction", {}) or {}),
+        source_path=getattr(latest, "source_path", None),
+    )
+
+
 def create_pulses_from_direction_events(
     prediction,
     now,
@@ -1087,7 +1192,7 @@ def event_icon_size(pulse, now, min_side):
     base_ratio = EVENT_ICON_MIN_SIZE_RATIO + (EVENT_ICON_MAX_SIZE_RATIO - EVENT_ICON_MIN_SIZE_RATIO) * math.sqrt(strength)
     age = pulse_age_ratio(pulse, now)
     pop = 1.0 + EVENT_ICON_POP_SCALE * max(0.0, 1.0 - age / EVENT_ICON_POP_AGE_RATIO)
-    return float(min_side) * base_ratio * pop
+    return float(min_side) * base_ratio * pop * float(EVENT_ICON_SIZE_SCALE)
 
 
 def event_icon_opacity(pulse, now):
@@ -1103,22 +1208,22 @@ def event_icon_opacity(pulse, now):
 
 def event_icon_color(pulse, now):
     red, green, blue, alpha = EVENT_ICON_RGBA
-    return QtGui.QColor(red, green, blue, int(clamp(alpha * event_icon_opacity(pulse, now), 0, 255)))
+    return QtGui.QColor(red, green, blue, int(clamp(alpha * event_icon_opacity(pulse, now) * EVENT_ICON_ALPHA_SCALE, 0, 255)))
 
 
 def event_icon_shadow_color(pulse, now):
     red, green, blue, alpha = EVENT_ICON_SHADOW_RGBA
-    return QtGui.QColor(red, green, blue, int(clamp(alpha * event_icon_opacity(pulse, now), 0, 255)))
+    return QtGui.QColor(red, green, blue, int(clamp(alpha * event_icon_opacity(pulse, now) * EVENT_ICON_ALPHA_SCALE, 0, 255)))
 
 
 def event_icon_accent_color(pulse, now):
     red, green, blue, alpha = color_rgba_for_kind(pulse.kind, EVENT_ICON_RGBA)
-    return QtGui.QColor(red, green, blue, int(clamp(alpha * event_icon_opacity(pulse, now), 0, 255)))
+    return QtGui.QColor(red, green, blue, int(clamp(alpha * event_icon_opacity(pulse, now) * EVENT_ICON_ALPHA_SCALE, 0, 255)))
 
 
 def event_icon_badge_color(pulse, now):
     red, green, blue, alpha = EVENT_ICON_BADGE_RGBA
-    return QtGui.QColor(red, green, blue, int(clamp(alpha * event_icon_opacity(pulse, now), 0, 255)))
+    return QtGui.QColor(red, green, blue, int(clamp(alpha * event_icon_opacity(pulse, now) * EVENT_ICON_ALPHA_SCALE, 0, 255)))
 
 
 def event_icon_label(kind):
@@ -1826,6 +1931,7 @@ class ParentWidget(QtWidgets.QWidget):
         self._last_global_event_times = {}
         self._previous_direction_levels = np.zeros(RADAR_SECTORS)
         self.direction_event_runtime = None
+        self._direction_event_prediction_history = []
         self.rolling_capture = None
         self.threshold_profile_name = "default"
         self.latest_direction_event_prediction = None
@@ -2006,6 +2112,13 @@ def consume_rolling_capture_trigger(path=None):
     except OSError:
         pass
     return True
+
+
+def write_rolling_capture_trigger(path=None):
+    path = Path(path or ROLLING_CAPTURE_TRIGGER_PATH).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(time.time()), encoding="utf-8")
+    return path
 
 
 class DirectionEventRuntime:
@@ -2357,6 +2470,14 @@ def update_direction_event_runtime(radarObject, audio_blocks, now, capture_time=
     prediction = runtime.maybe_submit(now)
     radarObject.ast_latency_ms = getattr(runtime, "latest_latency_ms", None)
     if prediction is not None:
+        if DIRECTION_EVENT_SMOOTHING_ENABLED and DIRECTION_EVENT_SMOOTHING_WINDOW > 1:
+            history = getattr(radarObject, "_direction_event_prediction_history", [])
+            history.append(prediction)
+            history = history[-int(DIRECTION_EVENT_SMOOTHING_WINDOW) :]
+            radarObject._direction_event_prediction_history = history
+            prediction = smooth_direction_event_predictions(history, window=DIRECTION_EVENT_SMOOTHING_WINDOW)
+        else:
+            radarObject._direction_event_prediction_history = [prediction]
         radarObject.latest_direction_event_prediction = prediction
     return prediction
 

@@ -113,6 +113,8 @@ and `debug` display behavior from the same teacher prediction. Use the **Tag**
 row to append the current sample to a CSV library as `gunshot`, `vehicle`,
 `footstep`, `unknown`, or `bad sample`. The GUI also shows device/channel sanity
 messages and warns when an 8+ channel recording only contains stereo-like signal.
+If the live overlay is running, **Save Last 5s** creates the rolling-capture
+trigger file for the overlay, so you do not need to run `touch` manually.
 The same capture path is available as a CLI:
 
 ```sh
@@ -134,6 +136,10 @@ Re-evaluate a tagged sample library after changing thresholds:
   --top-k 5
 ```
 
+This writes both a per-sample evaluation CSV and a profile summary CSV by
+default. The summary counts missed target tags, unknown/bad samples that still
+show icons, multi-icon rows, and gunshot suppression rows.
+
 Run the application:
 
 ```sh
@@ -149,7 +155,9 @@ cp soundradar.local.example.json soundradar.local.json
 Edit `soundradar.local.json` for machine-specific settings such as
 `teacher_model`, `device`, `top_k`, `threshold_profile`, and rolling capture
 paths. The file is ignored by git, so switching between `ast` and
-`efficientat-mn20` no longer requires editing `soundRadar.py`.
+`efficientat-mn20` no longer requires editing `soundRadar.py`. Visual tuning can
+also live there: `event_icon_scale`, `event_icon_opacity`,
+`event_icon_labels`, `event_smoothing_enabled`, and `event_smoothing_window`.
 
 Threshold/cooldown tuning can be selected without editing code:
 
