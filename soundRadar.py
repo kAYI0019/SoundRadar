@@ -413,19 +413,20 @@ GUNSHOT_DIRECTION_NEIGHBORS = {
 EVENT_ICON_DURATION = 3.5
 EVENT_ICON_HOLD_AGE_RATIO = 0.68
 EVENT_ICON_DISTANCE_RATIO = 0.40
-EVENT_ICON_STACK_SPACING_RATIO = 0.070
-EVENT_ICON_MIN_SIZE_RATIO = 0.040
-EVENT_ICON_MAX_SIZE_RATIO = 0.066
+EVENT_ICON_STACK_SPACING_RATIO = 0.052
+EVENT_ICON_MIN_SIZE_RATIO = 0.026
+EVENT_ICON_MAX_SIZE_RATIO = 0.044
 EVENT_ICON_POP_AGE_RATIO = 0.28
-EVENT_ICON_POP_SCALE = 0.16
-EVENT_ICON_RGBA = (246, 242, 218, 235)
-EVENT_ICON_SHADOW_RGBA = (0, 0, 0, 170)
-EVENT_ICON_BADGE_RGBA = (4, 8, 10, 148)
+EVENT_ICON_POP_SCALE = 0.08
+EVENT_ICON_SHOW_LABELS = False
+EVENT_ICON_RGBA = (238, 236, 220, 205)
+EVENT_ICON_SHADOW_RGBA = (0, 0, 0, 120)
+EVENT_ICON_BADGE_RGBA = (4, 8, 10, 96)
 EVENT_KIND_RGBA = {
-    "footstep": (78, 226, 118, 150),
-    "gunshot": (255, 136, 42, 225),
-    "vehicle": (76, 166, 255, 185),
-    "explosion": (255, 76, 64, 235),
+    "footstep": (78, 226, 118, 125),
+    "gunshot": (255, 150, 70, 170),
+    "vehicle": (76, 166, 255, 135),
+    "explosion": (255, 90, 74, 180),
 }
 EVENT_ICON_LABELS = {
     "explosion": "BOOM",
@@ -1550,10 +1551,13 @@ class RippleOverlayWidget(QtWidgets.QWidget):
         return max(2.0, size * 0.08)
 
     def _draw_event_icon_badge(self, painter, size, badge_color, accent_color):
-        rect = QtCore.QRectF(-size * 0.66, -size * 0.60, size * 1.32, size * 1.36)
+        if EVENT_ICON_SHOW_LABELS:
+            rect = QtCore.QRectF(-size * 0.66, -size * 0.60, size * 1.32, size * 1.36)
+        else:
+            rect = QtCore.QRectF(-size * 0.54, -size * 0.54, size * 1.08, size * 1.08)
         painter.setBrush(QtGui.QBrush(badge_color))
         painter.setPen(QtGui.QPen(accent_color, max(2.5, size * 0.055), QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
-        painter.drawRoundedRect(rect, size * 0.18, size * 0.18)
+        painter.drawRoundedRect(rect, size * 0.16, size * 0.16)
 
     def _draw_event_icon_label(self, painter, label, size, color, shadow_color):
         font = QtGui.QFont("Arial")
@@ -1638,8 +1642,9 @@ class RippleOverlayWidget(QtWidgets.QWidget):
         painter.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
         self._draw_event_icon_badge(painter, size, badge_color, accent_color)
         painter.save()
-        painter.translate(0, -size * 0.11)
-        glyph_size = size * 0.88
+        if EVENT_ICON_SHOW_LABELS:
+            painter.translate(0, -size * 0.11)
+        glyph_size = size * (0.88 if EVENT_ICON_SHOW_LABELS else 0.78)
         if pulse.kind == "gunshot":
             self._draw_event_icon_gunshot(painter, glyph_size, color, accent_color, shadow_color)
         elif pulse.kind == "explosion":
@@ -1649,7 +1654,8 @@ class RippleOverlayWidget(QtWidgets.QWidget):
         elif pulse.kind == "footstep":
             self._draw_event_icon_footstep(painter, glyph_size, color, accent_color, shadow_color)
         painter.restore()
-        self._draw_event_icon_label(painter, event_icon_label(pulse.kind), size, color, shadow_color)
+        if EVENT_ICON_SHOW_LABELS:
+            self._draw_event_icon_label(painter, event_icon_label(pulse.kind), size, color, shadow_color)
         painter.restore()
 
     def _paint_watercolor_pulse(self, painter, pulse, now, min_side, center_x, center_y):

@@ -713,14 +713,16 @@ class SoundRadarPulseTests(unittest.TestCase):
         self.assertAlmostEqual(first.y(), second.y())
 
     def test_event_icon_size_ratios_are_compact_for_dual_icons(self):
-        self.assertLessEqual(soundRadar.EVENT_ICON_MAX_SIZE_RATIO, 0.066)
-        self.assertLessEqual(soundRadar.EVENT_ICON_MIN_SIZE_RATIO, 0.040)
+        self.assertLessEqual(soundRadar.EVENT_ICON_MAX_SIZE_RATIO, 0.044)
+        self.assertLessEqual(soundRadar.EVENT_ICON_MIN_SIZE_RATIO, 0.026)
+        self.assertFalse(soundRadar.EVENT_ICON_SHOW_LABELS)
 
     def test_event_icon_size_uses_strength_without_moving_direction(self):
         weak = soundRadar.SoundPulse(sector=1, strength=0.2, created_at=10.0, kind="gunshot")
         strong = soundRadar.SoundPulse(sector=1, strength=0.9, created_at=10.0, kind="gunshot")
 
         self.assertGreater(soundRadar.event_icon_size(strong, now=10.1, min_side=720), soundRadar.event_icon_size(weak, now=10.1, min_side=720))
+        self.assertLessEqual(soundRadar.event_icon_size(strong, now=10.1, min_side=720), 720 * 0.048)
         self.assertEqual(
             soundRadar.event_icon_center(weak.sector, 720, 360, 360),
             soundRadar.event_icon_center(strong.sector, 720, 360, 360),
