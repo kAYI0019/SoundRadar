@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import asdict, is_dataclass
 from datetime import datetime
 import json
 from pathlib import Path
@@ -282,13 +283,22 @@ def profile_comparison_payload(
 
 def _prediction_scores_payload(prediction) -> dict[str, object]:
     scores_by_direction = getattr(prediction, "direction_event_scores", {}) or {}
+    raw_scores_by_direction = getattr(prediction, "raw_direction_event_scores", {}) or {}
     active_by_direction = getattr(prediction, "active_events_by_direction", {}) or {}
     top_labels_by_direction = getattr(prediction, "top_labels_by_direction", {}) or {}
+    label_evidence_by_direction = getattr(prediction, "event_label_evidence_by_direction", {}) or {}
+    resolver_evidence_by_direction = getattr(prediction, "vehicle_gun_evidence_by_direction", {}) or {}
+    resolver_decisions_by_direction = getattr(prediction, "vehicle_gun_decisions_by_direction", {}) or {}
+    score_semantics_by_direction = getattr(prediction, "label_score_semantics_by_direction", {}) or {}
     payload = {}
     for direction in DIRECTION_NAMES:
         scores = scores_by_direction.get(direction, {}) or {}
+        raw_scores = raw_scores_by_direction.get(direction, scores) or {}
+        resolver_evidence = resolver_evidence_by_direction.get(direction)
+        resolver_decision = resolver_decisions_by_direction.get(direction)
         payload[direction] = {
             "scores": {event_name: float(scores.get(event_name, 0.0)) for event_name in EVENT_SCORE_ORDER},
+            "raw_scores": {event_name: float(raw_scores.get(event_name, 0.0)) for event_name in EVENT_SCORE_ORDER},
             "active_events": list(active_by_direction.get(direction, ())),
             "top_labels": [
                 {
@@ -298,6 +308,10 @@ def _prediction_scores_payload(prediction) -> dict[str, object]:
                 for item in top_labels_by_direction.get(direction, ())
                 if isinstance(item, dict)
             ],
+            "event_label_evidence": label_evidence_by_direction.get(direction, {}),
+            "label_score_semantics": str(score_semantics_by_direction.get(direction, "unknown")),
+            "vehicle_gun_evidence": asdict(resolver_evidence) if is_dataclass(resolver_evidence) else resolver_evidence,
+            "vehicle_gun_decision": asdict(resolver_decision) if is_dataclass(resolver_decision) else resolver_decision,
         }
     return payload
 

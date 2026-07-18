@@ -9,7 +9,7 @@ when optional ML dependencies are not installed.
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext, redirect_stdout
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import argparse
 import io
@@ -51,8 +51,46 @@ AST_MEL_FILTER_WARNING_PATTERN = (
     r"num_mel_filters.*num_frequency_bins.*"
 )
 
-# Keep these conservative: they map AudioSet labels into the coarse events used
-# by the accessibility overlay, not into exact PUBG semantic classes.
+# Keep vehicle/gun label routing in one place.  The same mapping is used for
+# coarse event scores and for the full (not Top-K-limited) resolver evidence.
+GUNSHOT_LABEL_KEYWORDS = (
+    "gunshot",
+    "gunfire",
+    "firearm",
+    "machine gun",
+    "fusillade",
+    "artillery fire",
+    "cap gun",
+)
+ROAD_VEHICLE_LABEL_KEYWORDS = (
+    "vehicle",
+    "motor vehicle",
+    "car",
+    "truck",
+    "bus",
+    "motorcycle",
+    "engine",
+    "engine starting",
+    "idling",
+    "accelerating, revving, vroom",
+    "traffic noise",
+    "roadway noise",
+    "tire squeal",
+)
+NON_ROAD_ENGINE_LABEL_KEYWORDS = (
+    "light engine",
+    "medium engine",
+    "heavy engine",
+    "aircraft engine",
+    "jet engine",
+)
+VEHICLE_GUN_LABEL_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "gunshot": GUNSHOT_LABEL_KEYWORDS,
+    "vehicle": ROAD_VEHICLE_LABEL_KEYWORDS,
+}
+
+# These map AudioSet labels into the coarse events used by the accessibility
+# overlay, not into exact PUBG semantic classes.
 EVENT_LABEL_KEYWORDS: dict[str, tuple[str, ...]] = {
     "footstep": (
         "footstep",
@@ -63,30 +101,8 @@ EVENT_LABEL_KEYWORDS: dict[str, tuple[str, ...]] = {
         "running",
         "shuffle",
     ),
-    "gunshot": (
-        "gunshot",
-        "gunfire",
-        "firearm",
-        "machine gun",
-        "fusillade",
-        "artillery fire",
-        "cap gun",
-    ),
-    "vehicle": (
-        "vehicle",
-        "motor vehicle",
-        "car",
-        "truck",
-        "bus",
-        "motorcycle",
-        "engine",
-        "engine starting",
-        "idling",
-        "accelerating, revving, vroom",
-        "traffic noise",
-        "roadway noise",
-        "tire squeal",
-    ),
+    "gunshot": GUNSHOT_LABEL_KEYWORDS,
+    "vehicle": ROAD_VEHICLE_LABEL_KEYWORDS,
     "explosion": (
         "explosion",
         "blast",
@@ -169,6 +185,38 @@ def map_audioset_scores_to_events(
             explicit_background = max(explicit_background, _clamp_probability(float(raw_score)))
     mapped["background"] = max(explicit_background, 1.0 - target_max)
     return {name: _clamp_probability(mapped[name]) for name in DEFAULT_CLASSES}
+
+
+def event_label_evidence_from_scores(
+    label_scores: Mapping[str, float],
+    *,
+    label_keywords: Mapping[str, tuple[str, ...]] = VEHICLE_GUN_LABEL_KEYWORDS,
+) -> dict[str, dict[str, float]]:
+    """Preserve all vehicle/gun AudioSet label scores, independent of Top-K."""
+
+    evidence: dict[str, dict[str, float]] = {event_name: {} for event_name in label_keywords}
+    for label, raw_score in label_scores.items():
+        for event_name, keywords in label_keywords.items():
+            if event_name == "vehicle" and _label_matches(label, NON_ROAD_ENGINE_LABEL_KEYWORDS):
+                continue
+            if _label_matches(label, keywords):
+                evidence[event_name][str(label)] = _clamp_probability(float(raw_score))
+    return evidence
+
+
+def event_label_evidence_from_array(
+    scores: np.ndarray,
+    labels: tuple[str, ...] | list[str],
+) -> dict[str, dict[str, float]]:
+    """Vector-friendly adapter used by both AST and EfficientAT backends."""
+
+    values = np.asarray(scores, dtype=np.float32).reshape(-1)
+    return event_label_evidence_from_scores(
+        {
+            _label_from_sequence(labels, index): float(values[index])
+            for index in range(min(len(labels), int(values.size)))
+        }
+    )
 
 
 def active_soundradar_events(
@@ -479,6 +527,8 @@ class AstPrediction:
     top_labels: list[dict[str, object]]
     soundradar_events: dict[str, float]
     active_events: list[str]
+    event_label_evidence: dict[str, dict[str, float]] = field(default_factory=dict)
+    label_score_semantics: str = "unknown"
 
     def to_jsonable(self) -> dict[str, object]:
         return {
@@ -488,6 +538,8 @@ class AstPrediction:
             "top_labels": self.top_labels,
             "soundradar_events": self.soundradar_events,
             "active_events": self.active_events,
+            "event_label_evidence": self.event_label_evidence,
+            "label_score_semantics": self.label_score_semantics,
         }
 
 
@@ -691,6 +743,8 @@ class AstAudioSetTeacher:
             top_labels=top_labels,
             soundradar_events=mapped,
             active_events=active_soundradar_events(mapped),
+            event_label_evidence=event_label_evidence_from_array(probabilities, labels),
+            label_score_semantics="sigmoid_probability",
         )
 
     def predict_file(self, path: str | Path, *, top_k: int = 12) -> AstPrediction:
@@ -931,6 +985,8 @@ class EfficientATAudioSetTeacher:
             top_labels=top_labels,
             soundradar_events=mapped,
             active_events=active_soundradar_events(mapped),
+            event_label_evidence=event_label_evidence_from_array(relative_scores, labels),
+            label_score_semantics="relative_logit_evidence",
         )
 
     def _prediction_from_probabilities(
@@ -956,6 +1012,8 @@ class EfficientATAudioSetTeacher:
             top_labels=top_labels,
             soundradar_events=mapped,
             active_events=active_soundradar_events(mapped),
+            event_label_evidence=event_label_evidence_from_array(probabilities, labels),
+            label_score_semantics="probability",
         )
 
     def predict_file(self, path: str | Path, *, top_k: int = 12) -> AstPrediction:

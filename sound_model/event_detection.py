@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 
 import numpy as np
 
@@ -88,8 +88,22 @@ class SmoothedDirectionEventPrediction:
     top_labels_by_direction: dict
     source_path: str | None = None
     mode: str = "smoothed direction-event inference"
+    raw_direction_event_scores: dict = field(default_factory=dict)
+    event_label_evidence_by_direction: dict = field(default_factory=dict)
+    vehicle_gun_evidence_by_direction: dict = field(default_factory=dict)
+    vehicle_gun_decisions_by_direction: dict = field(default_factory=dict)
+    label_score_semantics_by_direction: dict = field(default_factory=dict)
+    inference_latency_ms: float | None = None
 
     def to_jsonable(self):
+        resolver_evidence = {
+            direction: asdict(evidence) if is_dataclass(evidence) else evidence
+            for direction, evidence in self.vehicle_gun_evidence_by_direction.items()
+        }
+        resolver_decisions = {
+            direction: asdict(decision) if is_dataclass(decision) else decision
+            for direction, decision in self.vehicle_gun_decisions_by_direction.items()
+        }
         return {
             "source_path": self.source_path,
             "sample_rate": self.sample_rate,
@@ -99,6 +113,12 @@ class SmoothedDirectionEventPrediction:
             "direction_event_scores": self.direction_event_scores,
             "active_events_by_direction": self.active_events_by_direction,
             "top_labels_by_direction": self.top_labels_by_direction,
+            "raw_direction_event_scores": self.raw_direction_event_scores,
+            "event_label_evidence_by_direction": self.event_label_evidence_by_direction,
+            "vehicle_gun_evidence_by_direction": resolver_evidence,
+            "vehicle_gun_decisions_by_direction": resolver_decisions,
+            "label_score_semantics_by_direction": self.label_score_semantics_by_direction,
+            "inference_latency_ms": self.inference_latency_ms,
         }
 
 
@@ -423,6 +443,12 @@ def smooth_direction_event_predictions(predictions, *, window=DEFAULT_SMOOTHING_
         active_events_by_direction=smoothed_active,
         top_labels_by_direction=dict(getattr(latest, "top_labels_by_direction", {}) or {}),
         source_path=getattr(latest, "source_path", None),
+        raw_direction_event_scores=dict(getattr(latest, "raw_direction_event_scores", {}) or {}),
+        event_label_evidence_by_direction=dict(getattr(latest, "event_label_evidence_by_direction", {}) or {}),
+        vehicle_gun_evidence_by_direction=dict(getattr(latest, "vehicle_gun_evidence_by_direction", {}) or {}),
+        vehicle_gun_decisions_by_direction=dict(getattr(latest, "vehicle_gun_decisions_by_direction", {}) or {}),
+        label_score_semantics_by_direction=dict(getattr(latest, "label_score_semantics_by_direction", {}) or {}),
+        inference_latency_ms=getattr(latest, "inference_latency_ms", None),
     )
 
 

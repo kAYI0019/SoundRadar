@@ -12,6 +12,7 @@ from sound_model.ast_teacher import (
     build_audioset_background_indices,
     build_audioset_event_indices,
     create_audio_event_teacher,
+    event_label_evidence_from_array,
     configure_torch_runtime_for_device,
     compile_torch_model_if_requested,
     normalize_teacher_model_choice,
@@ -335,6 +336,23 @@ class AstTeacherMappingTests(unittest.TestCase):
         top_labels = top_k_label_scores(probabilities, labels, top_k=2)
 
         self.assertEqual(top_labels, [{"label": "gun", "score": 0.8}, {"label": "vehicle", "score": 0.6}])
+
+    def test_vehicle_gun_evidence_preserves_relevant_scores_outside_top_k(self):
+        labels = (
+            "Speech",
+            "Music",
+            "Gunshot, gunfire",
+            "Motor vehicle (road)",
+            "Light engine (high frequency)",
+        )
+        scores = np.array([0.99, 0.95, 0.42, 0.31, 0.88], dtype=np.float32)
+
+        self.assertEqual([item["label"] for item in top_k_label_scores(scores, labels, top_k=2)], ["Speech", "Music"])
+        evidence = event_label_evidence_from_array(scores, labels)
+
+        self.assertAlmostEqual(evidence["gunshot"]["Gunshot, gunfire"], 0.42)
+        self.assertAlmostEqual(evidence["vehicle"]["Motor vehicle (road)"], 0.31)
+        self.assertNotIn("Light engine (high frequency)", evidence["vehicle"])
 
     def test_predict_waveforms_uses_torch_inference_mode(self):
         class FakeInput:

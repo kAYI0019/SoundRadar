@@ -9,10 +9,11 @@ train or fine-tune anything.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import argparse
 import json
+import time
 from typing import Any, Mapping, Protocol, cast
 
 import numpy as np
@@ -20,12 +21,18 @@ import numpy as np
 from .ast_teacher import (
     DEFAULT_TEACHER_MODEL,
     TEACHER_MODEL_CHOICES,
-    _label_matches,
     active_soundradar_events,
     create_audio_event_teacher,
+    event_label_evidence_from_scores,
     load_audio_channels,
 )
 from .audio_features import DEFAULT_CLASSES
+from .vehicle_gun_resolver import (
+    VehicleGunDecision,
+    VehicleGunEvidence,
+    resolve_vehicle_gun,
+    strong_road_vehicle_evidence,
+)
 
 DIRECTION_CHANNELS: tuple[tuple[str, int], ...] = (
     ("front_left", 0),
@@ -47,29 +54,6 @@ SOUNDRADAR_CHANNEL_KEYS: dict[str, str] = {
 }
 DIRECTION_NAMES: tuple[str, ...] = tuple(direction for direction, _ in DIRECTION_CHANNELS)
 DIRECTION_SILENCE_PEAK = 1.0e-4
-DIRECTION_TRANSIENT_GUNSHOT_THRESHOLD = 0.35
-ROAD_VEHICLE_LABEL_KEYWORDS = (
-    "vehicle",
-    "motor vehicle",
-    "car",
-    "truck",
-    "bus",
-    "motorcycle",
-    "engine",
-    "engine starting",
-    "idling",
-    "accelerating, revving, vroom",
-    "traffic noise",
-    "roadway noise",
-    "tire squeal",
-)
-NON_ROAD_TRANSIENT_ENGINE_LABEL_KEYWORDS = (
-    "light engine",
-    "medium engine",
-    "heavy engine",
-    "aircraft engine",
-    "jet engine",
-)
 
 
 def background_event_scores() -> dict[str, float]:
@@ -128,14 +112,104 @@ def transient_gunshot_score(waveform: np.ndarray, sample_rate: int) -> float:
     return float(min(1.0, 0.4 * peak_score + 0.3 * crest_score + 0.3 * concentration_score))
 
 
-def top_labels_include_road_vehicle(top_labels) -> bool:
+def _max_label_evidence(event_label_evidence, event_name: str) -> float:
+    scores = (event_label_evidence or {}).get(event_name, {}) or {}
+    if isinstance(scores, Mapping):
+        return max((float(score) for score in scores.values()), default=0.0)
+    return 0.0
+
+
+def _top_label_evidence(top_labels) -> dict[str, dict[str, float]]:
+    label_scores = {}
     for item in top_labels or ():
-        label = str(item.get("label", "") if isinstance(item, Mapping) else item)
-        if _label_matches(label, NON_ROAD_TRANSIENT_ENGINE_LABEL_KEYWORDS):
+        if not isinstance(item, Mapping):
             continue
-        if _label_matches(label, ROAD_VEHICLE_LABEL_KEYWORDS):
-            return True
-    return False
+        label_scores[str(item.get("label", ""))] = float(item.get("score", 0.0) or 0.0)
+    return event_label_evidence_from_scores(label_scores)
+
+
+def top_labels_include_road_vehicle(top_labels) -> bool:
+    """Compatibility helper using the resolver's score-and-margin vehicle gate."""
+
+    evidence = _top_label_evidence(top_labels)
+    return strong_road_vehicle_evidence(
+        _max_label_evidence(evidence, "vehicle"),
+        _max_label_evidence(evidence, "gunshot"),
+    )
+
+
+def waveform_vehicle_gun_features(
+    waveform: np.ndarray,
+    sample_rate: int,
+) -> dict[str, float]:
+    samples = np.asarray(waveform, dtype=np.float32)
+    if samples.size == 0:
+        return {"transient_score": 0.0, "peak": 0.0, "rms": 0.0, "crest_factor": 0.0}
+    peak = float(np.nanmax(np.abs(samples)))
+    rms = float(np.sqrt(np.nanmean(samples * samples)))
+    if not np.isfinite(peak):
+        peak = 0.0
+    if not np.isfinite(rms) or rms <= 1.0e-9:
+        rms = 0.0
+    crest_factor = peak / rms if rms > 0.0 else 0.0
+    return {
+        "transient_score": transient_gunshot_score(samples, sample_rate),
+        "peak": peak,
+        "rms": rms,
+        "crest_factor": crest_factor,
+    }
+
+
+def resolve_waveform_event_scores(
+    scores: dict[str, float],
+    waveform: np.ndarray,
+    sample_rate: int,
+    *,
+    event_label_evidence=None,
+    top_labels=None,
+) -> tuple[dict[str, float], VehicleGunEvidence, VehicleGunDecision]:
+    """Apply the resolver and return adjusted scores plus its audit trail."""
+
+    raw_scores = dict(scores)
+    label_evidence = event_label_evidence or _top_label_evidence(top_labels)
+    waveform_features = waveform_vehicle_gun_features(waveform, sample_rate)
+    evidence = VehicleGunEvidence(
+        gunshot_teacher_score=float(raw_scores.get("gunshot", 0.0)),
+        vehicle_teacher_score=float(raw_scores.get("vehicle", 0.0)),
+        gunshot_label_score=_max_label_evidence(label_evidence, "gunshot"),
+        road_vehicle_label_score=_max_label_evidence(label_evidence, "vehicle"),
+        **waveform_features,
+    )
+
+    if float(raw_scores.get("explosion", 0.0)) >= 0.25:
+        decision = VehicleGunDecision(
+            label="unknown",
+            confidence=1.0,
+            gunshot_evidence=float(raw_scores.get("gunshot", 0.0)),
+            vehicle_evidence=float(raw_scores.get("vehicle", 0.0)),
+            reason="resolver skipped; explosion evidence is active",
+        )
+        return raw_scores, evidence, decision
+
+    decision = resolve_vehicle_gun(evidence)
+    adjusted = dict(raw_scores)
+    if decision.label == "gunshot":
+        adjusted["gunshot"] = max(
+            float(raw_scores.get("gunshot", 0.0)),
+            float(decision.gunshot_evidence),
+            float(evidence.transient_score),
+        )
+        adjusted["vehicle"] = 0.0
+    elif decision.label == "vehicle":
+        adjusted["gunshot"] = 0.0
+        adjusted["vehicle"] = max(
+            float(raw_scores.get("vehicle", 0.0)),
+            float(decision.vehicle_evidence),
+        )
+    else:
+        adjusted["gunshot"] = 0.0
+        adjusted["vehicle"] = 0.0
+    return adjusted, evidence, decision
 
 
 def apply_waveform_event_heuristics(
@@ -144,18 +218,12 @@ def apply_waveform_event_heuristics(
     sample_rate: int,
     top_labels=None,
 ) -> dict[str, float]:
-    adjusted = dict(scores)
-    impulse_score = transient_gunshot_score(waveform, sample_rate)
-    vehicle_score = float(adjusted.get("vehicle", 0.0))
-    gunshot_score = float(adjusted.get("gunshot", 0.0))
-    explosion_score = float(adjusted.get("explosion", 0.0))
-    if (
-        impulse_score >= DIRECTION_TRANSIENT_GUNSHOT_THRESHOLD
-        and explosion_score < 0.25
-        and not top_labels_include_road_vehicle(top_labels)
-    ):
-        adjusted["gunshot"] = max(gunshot_score, impulse_score)
-        adjusted["vehicle"] = min(vehicle_score, 0.25 * (1.0 - impulse_score))
+    adjusted, _, _ = resolve_waveform_event_scores(
+        scores,
+        waveform,
+        sample_rate,
+        top_labels=top_labels,
+    )
     return adjusted
 
 
@@ -172,6 +240,12 @@ class DirectionEventPrediction:
     top_labels_by_direction: dict[str, list[dict[str, float]]]
     source_path: str | None = None
     mode: str = "7-direction teacher inference"
+    raw_direction_event_scores: dict[str, dict[str, float]] = field(default_factory=dict)
+    event_label_evidence_by_direction: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
+    vehicle_gun_evidence_by_direction: dict[str, VehicleGunEvidence] = field(default_factory=dict)
+    vehicle_gun_decisions_by_direction: dict[str, VehicleGunDecision] = field(default_factory=dict)
+    label_score_semantics_by_direction: dict[str, str] = field(default_factory=dict)
+    inference_latency_ms: float | None = None
 
     def to_jsonable(self) -> dict[str, object]:
         return {
@@ -183,6 +257,18 @@ class DirectionEventPrediction:
             "direction_event_scores": self.direction_event_scores,
             "active_events_by_direction": self.active_events_by_direction,
             "top_labels_by_direction": self.top_labels_by_direction,
+            "raw_direction_event_scores": self.raw_direction_event_scores,
+            "event_label_evidence_by_direction": self.event_label_evidence_by_direction,
+            "vehicle_gun_evidence_by_direction": {
+                direction: asdict(evidence)
+                for direction, evidence in self.vehicle_gun_evidence_by_direction.items()
+            },
+            "vehicle_gun_decisions_by_direction": {
+                direction: asdict(decision)
+                for direction, decision in self.vehicle_gun_decisions_by_direction.items()
+            },
+            "label_score_semantics_by_direction": self.label_score_semantics_by_direction,
+            "inference_latency_ms": self.inference_latency_ms,
         }
 
 
@@ -283,10 +369,16 @@ def score_direction_events(
     directions = list(waveforms)
     direction_waveforms = [waveforms[direction] for direction in directions]
     direction_scores: dict[str, dict[str, float]] = {}
+    raw_direction_scores: dict[str, dict[str, float]] = {}
     active_by_direction: dict[str, list[str]] = {}
     top_labels_by_direction: dict[str, list[dict[str, float]]] = {}
+    label_evidence_by_direction: dict[str, dict[str, dict[str, float]]] = {}
+    resolver_evidence_by_direction: dict[str, VehicleGunEvidence] = {}
+    resolver_decisions_by_direction: dict[str, VehicleGunDecision] = {}
+    score_semantics_by_direction: dict[str, str] = {}
 
     predict_waveforms = getattr(teacher, "predict_waveforms", None)
+    inference_started_at = time.perf_counter()
     if callable(predict_waveforms):
         batch_predict = cast(Any, predict_waveforms)
         predictions = list(
@@ -306,22 +398,35 @@ def score_direction_events(
             teacher.predict_waveform(waveform, sample_rate, top_k=top_k, audio_path=direction)
             for direction, waveform in zip(directions, direction_waveforms)
         ]
+    inference_latency_ms = max(0.0, (time.perf_counter() - inference_started_at) * 1000.0)
 
     for direction, waveform, prediction in zip(directions, direction_waveforms, predictions):
         if not direction_waveform_has_signal(waveform):
             direction_scores[direction] = background_event_scores()
+            raw_direction_scores[direction] = background_event_scores()
             active_by_direction[direction] = []
             top_labels_by_direction[direction] = []
+            label_evidence_by_direction[direction] = {"gunshot": {}, "vehicle": {}}
             continue
-        adjusted_scores = apply_waveform_event_heuristics(
-            dict(prediction.soundradar_events),
+        raw_scores = dict(prediction.soundradar_events)
+        label_evidence = getattr(prediction, "event_label_evidence", None) or _top_label_evidence(
+            getattr(prediction, "top_labels", ())
+        )
+        adjusted_scores, resolver_evidence, resolver_decision = resolve_waveform_event_scores(
+            raw_scores,
             waveform,
             sample_rate,
-            getattr(prediction, "top_labels", ()),
+            event_label_evidence=label_evidence,
+            top_labels=getattr(prediction, "top_labels", ()),
         )
+        raw_direction_scores[direction] = raw_scores
         direction_scores[direction] = adjusted_scores
         active_by_direction[direction] = active_soundradar_events(adjusted_scores)
         top_labels_by_direction[direction] = list(prediction.top_labels)
+        label_evidence_by_direction[direction] = label_evidence
+        resolver_evidence_by_direction[direction] = resolver_evidence
+        resolver_decisions_by_direction[direction] = resolver_decision
+        score_semantics_by_direction[direction] = str(getattr(prediction, "label_score_semantics", "unknown"))
 
     return DirectionEventPrediction(
         sample_rate=sample_rate,
@@ -329,6 +434,12 @@ def score_direction_events(
         active_events_by_direction=active_by_direction,
         top_labels_by_direction=top_labels_by_direction,
         source_path=source_path,
+        raw_direction_event_scores=raw_direction_scores,
+        event_label_evidence_by_direction=label_evidence_by_direction,
+        vehicle_gun_evidence_by_direction=resolver_evidence_by_direction,
+        vehicle_gun_decisions_by_direction=resolver_decisions_by_direction,
+        label_score_semantics_by_direction=score_semantics_by_direction,
+        inference_latency_ms=inference_latency_ms,
     )
 
 

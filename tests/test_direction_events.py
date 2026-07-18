@@ -228,12 +228,15 @@ class DirectionEventScoreTests(unittest.TestCase):
         prediction = score_direction_events(audio, sample_rate, RoadVehicleTeacher(), top_k=3)
 
         self.assertEqual(prediction.direction_event_scores["front_left"]["vehicle"], 0.70)
-        self.assertEqual(prediction.direction_event_scores["front_left"]["gunshot"], 0.10)
-        self.assertEqual(prediction.active_events_by_direction["front_left"], ["gunshot", "vehicle"])
+        self.assertEqual(prediction.direction_event_scores["front_left"]["gunshot"], 0.0)
+        self.assertEqual(prediction.raw_direction_event_scores["front_left"]["gunshot"], 0.10)
+        self.assertEqual(prediction.active_events_by_direction["front_left"], ["vehicle"])
+        self.assertEqual(prediction.vehicle_gun_decisions_by_direction["front_left"].label, "vehicle")
 
     def test_top_labels_include_road_vehicle_excludes_non_road_engine_noise(self):
         self.assertTrue(top_labels_include_road_vehicle([{"label": "Engine", "score": 0.8}]))
         self.assertTrue(top_labels_include_road_vehicle([{"label": "Accelerating, revving, vroom", "score": 0.8}]))
+        self.assertFalse(top_labels_include_road_vehicle([{"label": "Engine", "score": 0.05}]))
         self.assertFalse(top_labels_include_road_vehicle([{"label": "Light engine (high frequency)", "score": 0.8}]))
 
     def test_score_direction_events_promotes_unclassified_transient_to_gunshot(self):
