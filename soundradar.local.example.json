@@ -6,7 +6,7 @@
   "top_k": 5,
   "threshold_profile": "default",
   "window_seconds": 1.0,
-  "interval_seconds": 1.25,
+  "interval_seconds": 0.5,
   "warmup": true,
   "rolling_capture_enabled": true,
   "rolling_capture_seconds": 5.0,

@@ -8,6 +8,71 @@ from sound_model.vehicle_gun_resolver import (
 
 
 class VehicleGunResolverTests(unittest.TestCase):
+    def test_transient_acoustic_features_break_ambiguous_evidence_toward_gunshot(self):
+        legacy = resolve_vehicle_gun(
+            VehicleGunEvidence(
+                gunshot_teacher_score=0.25,
+                vehicle_teacher_score=0.25,
+                gunshot_label_score=0.25,
+                road_vehicle_label_score=0.10,
+                transient_score=0.30,
+                peak=0.40,
+                rms=0.08,
+                crest_factor=10.0,
+            )
+        )
+        enriched = resolve_vehicle_gun(
+            VehicleGunEvidence(
+                gunshot_teacher_score=0.25,
+                vehicle_teacher_score=0.25,
+                gunshot_label_score=0.25,
+                road_vehicle_label_score=0.10,
+                transient_score=0.30,
+                peak=0.40,
+                rms=0.08,
+                crest_factor=10.0,
+                spectral_flux=0.90,
+                low_frequency_ratio=0.10,
+                mid_frequency_ratio=0.30,
+                high_frequency_ratio=0.60,
+                attack_time_ms=10.0,
+                peak_hold_time_ms=10.0,
+                decay_time_ms=20.0,
+                onset_duration_ms=40.0,
+                energy_concentration=0.90,
+            )
+        )
+
+        self.assertEqual(legacy.label, "unknown")
+        self.assertEqual(enriched.label, "gunshot")
+        self.assertIn("flux=0.900", enriched.reason)
+
+    def test_sustained_low_frequency_and_persistence_corroborate_vehicle(self):
+        enriched = resolve_vehicle_gun(
+            VehicleGunEvidence(
+                gunshot_teacher_score=0.25,
+                vehicle_teacher_score=0.25,
+                gunshot_label_score=0.10,
+                road_vehicle_label_score=0.25,
+                transient_score=0.10,
+                peak=0.30,
+                rms=0.10,
+                crest_factor=3.0,
+                spectral_flux=0.05,
+                low_frequency_ratio=0.90,
+                mid_frequency_ratio=0.10,
+                attack_time_ms=300.0,
+                peak_hold_time_ms=200.0,
+                decay_time_ms=600.0,
+                onset_duration_ms=900.0,
+                energy_concentration=0.08,
+                vehicle_persistence=1.0,
+            )
+        )
+
+        self.assertEqual(enriched.label, "vehicle")
+        self.assertIn("persistence=1.000", enriched.reason)
+
     def test_high_transient_and_gunshot_scores_resolve_to_gunshot(self):
         decision = resolve_vehicle_gun(
             VehicleGunEvidence(

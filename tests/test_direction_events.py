@@ -232,6 +232,12 @@ class DirectionEventScoreTests(unittest.TestCase):
         self.assertEqual(prediction.raw_direction_event_scores["front_left"]["gunshot"], 0.10)
         self.assertEqual(prediction.active_events_by_direction["front_left"], ["vehicle"])
         self.assertEqual(prediction.vehicle_gun_decisions_by_direction["front_left"].label, "vehicle")
+        payload = prediction.to_jsonable()
+        self.assertIn("resolver_direction_event_scores", payload)
+        self.assertIn("temporal_direction_event_scores", payload)
+        self.assertIn("spectral_flux", payload["vehicle_gun_evidence_by_direction"]["front_left"])
+        self.assertIn("vehicle_persistence", payload["vehicle_gun_evidence_by_direction"]["front_left"])
+        self.assertIn("confidence", payload["vehicle_gun_decisions_by_direction"]["front_left"])
 
     def test_top_labels_include_road_vehicle_excludes_non_road_engine_noise(self):
         self.assertTrue(top_labels_include_road_vehicle([{"label": "Engine", "score": 0.8}]))

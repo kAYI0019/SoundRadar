@@ -119,8 +119,19 @@ Input behavior:
   preserves the API but is not true 7-direction evidence.
 - Mono: duplicates the same waveform to all seven directions.
 
-This is intended for teacher/pseudo-labeling and prototyping. Real-time use will
-likely need batching, cooldown/smoothing, and eventually a smaller student model.
+The vehicle/gunshot resolver augments teacher evidence with NumPy-only spectral
+flux, 20-250/250-2000/2000+ Hz relative energy, RMS-envelope timing, and 50 ms
+energy concentration. In the live runtime, gunshots use immediate attack and
+one-frame fast decay; vehicles require two qualifying predictions and use
+0.60-on/0.40-keep hysteresis with a two-frame release. Other event classes keep
+the existing weighted smoothing behavior. Resolver thresholds and weights live
+in `VehicleGunResolverConfig`; temporal thresholds live in
+`EventTemporalConfig`.
+
+Analysis JSON separates `raw_direction_event_scores`,
+`resolver_direction_event_scores`, and `temporal_direction_event_scores`. The
+resolver evidence and decision objects include all acoustic features,
+`vehicle_persistence`, final label/confidence, and the explainable reason.
 
 ## Real 7.1 capture/replay samples
 

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from sound_model.direction_runtime import DirectionEventRuntime
+from sound_model.direction_runtime import DirectionEventRuntime, normalize_analysis_timing
 
 
 class ImmediateExecutor:
@@ -19,6 +19,78 @@ class ImmediateExecutor:
 
 
 class DirectionRuntimeTests(unittest.TestCase):
+    def test_interval_is_capped_to_window_to_prevent_analysis_gaps(self):
+        self.assertEqual(normalize_analysis_timing(1.0, 1.25), (1.0, 1.0))
+        runtime = DirectionEventRuntime(
+            sample_rate=10,
+            channel_count=1,
+            window_seconds=0.5,
+            interval_seconds=0.75,
+            executor=ImmediateExecutor(),
+            score_fn=lambda *args: SimpleNamespace(direction_event_scores={}),
+        )
+
+        self.assertEqual(runtime.interval_seconds, 0.5)
+        self.assertTrue(runtime.interval_was_capped)
+
+    def test_overlapping_windows_keep_boundary_impulse_in_analyzed_audio(self):
+        calls = []
+
+        def score_fn(audio, sample_rate, top_k, source_path):
+            calls.append(audio.copy())
+            return SimpleNamespace(direction_event_scores={})
+
+        runtime = DirectionEventRuntime(
+            sample_rate=10,
+            channel_count=1,
+            window_seconds=1.0,
+            interval_seconds=0.75,
+            executor=ImmediateExecutor(),
+            score_fn=score_fn,
+        )
+        runtime.append_blocks([np.zeros((10, 1), dtype=np.float32)])
+        runtime.maybe_submit(now=1.0)
+        boundary_block = np.zeros((8, 1), dtype=np.float32)
+        boundary_block[0, 0] = 1.0
+        runtime.append_blocks([boundary_block])
+
+        runtime.maybe_submit(now=1.75)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(float(np.max(calls[1])), 1.0)
+
+    def test_busy_inference_is_skipped_instead_of_queued(self):
+        class PendingFuture:
+            def done(self):
+                return False
+
+        class PendingExecutor:
+            def __init__(self):
+                self.submissions = 0
+
+            def submit(self, fn, *args):
+                self.submissions += 1
+                return PendingFuture()
+
+        executor = PendingExecutor()
+        runtime = DirectionEventRuntime(
+            sample_rate=10,
+            channel_count=1,
+            window_seconds=1.0,
+            interval_seconds=0.5,
+            executor=executor,
+            score_fn=lambda *args: None,
+        )
+        runtime.append_blocks([np.ones((10, 1), dtype=np.float32)])
+
+        runtime.maybe_submit(now=1.0)
+        runtime.maybe_submit(now=1.5)
+        runtime.maybe_submit(now=2.0)
+
+        self.assertEqual(executor.submissions, 1)
+        self.assertEqual(runtime.submitted_inference_count, 1)
+        self.assertEqual(runtime.busy_skip_count, 2)
+
     def test_runtime_scores_only_the_latest_audio_window_without_qt(self):
         calls = []
 

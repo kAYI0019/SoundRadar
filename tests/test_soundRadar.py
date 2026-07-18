@@ -1130,7 +1130,7 @@ class SoundRadarEventSmoothingTests(unittest.TestCase):
             }
         )
 
-    def test_smooth_direction_event_predictions_weights_recent_scores(self):
+    def test_smoothing_uses_latest_class_specific_temporal_scores(self):
         first = SimpleNamespace(
             sample_rate=48000,
             direction_event_scores={"right": {"gunshot": 0.90, "vehicle": 0.0, "footstep": 0.0, "explosion": 0.0}},
@@ -1148,9 +1148,9 @@ class SoundRadarEventSmoothingTests(unittest.TestCase):
 
         smoothed = soundRadar.smooth_direction_event_predictions([first, second], window=2)
 
-        self.assertAlmostEqual(smoothed.direction_event_scores["right"]["gunshot"], 0.30)
-        self.assertAlmostEqual(smoothed.direction_event_scores["right"]["vehicle"], 0.20)
-        self.assertEqual(smoothed.active_events_by_direction["right"], ["gunshot", "vehicle"])
+        self.assertEqual(smoothed.direction_event_scores["right"]["gunshot"], 0.0)
+        self.assertAlmostEqual(smoothed.direction_event_scores["right"]["vehicle"], 0.30)
+        self.assertEqual(smoothed.active_events_by_direction["right"], ["vehicle"])
         self.assertEqual(smoothed.top_labels_by_direction["right"][0]["label"], "Vehicle")
 
     def test_update_direction_event_runtime_returns_smoothed_prediction(self):
@@ -1204,7 +1204,8 @@ class SoundRadarEventSmoothingTests(unittest.TestCase):
         second = soundRadar.update_direction_event_runtime(radar, blocks, now=0.1, capture_time=0.1)
 
         self.assertAlmostEqual(first.direction_event_scores["right"]["gunshot"], 0.90)
-        self.assertAlmostEqual(second.direction_event_scores["right"]["gunshot"], 0.30)
+        self.assertLess(second.direction_event_scores["right"]["gunshot"], 0.10)
+        self.assertNotIn("gunshot", second.active_events_by_direction["right"])
         self.assertIs(radar.latest_direction_event_prediction, second)
 
 

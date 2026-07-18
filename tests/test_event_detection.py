@@ -30,7 +30,7 @@ class EventDetectionTests(unittest.TestCase):
         self.assertEqual(decision.allowed_directions, frozenset(("front_right",)))
         self.assertEqual(decision.spatially_suppressed_directions, frozenset(("front", "right")))
 
-    def test_smoothing_weights_recent_predictions(self):
+    def test_smoothing_keeps_latest_class_specific_temporal_scores(self):
         first = SimpleNamespace(
             sample_rate=48_000,
             direction_event_scores={"right": {"gunshot": 0.90, "vehicle": 0.0}},
@@ -48,9 +48,28 @@ class EventDetectionTests(unittest.TestCase):
 
         smoothed = event_detection.smooth_direction_event_predictions([first, second], window=2)
 
-        self.assertAlmostEqual(smoothed.direction_event_scores["right"]["gunshot"], 0.30)
-        self.assertAlmostEqual(smoothed.direction_event_scores["right"]["vehicle"], 0.20)
-        self.assertEqual(smoothed.active_events_by_direction["right"], ["gunshot", "vehicle"])
+        self.assertEqual(smoothed.direction_event_scores["right"]["gunshot"], 0.0)
+        self.assertAlmostEqual(smoothed.direction_event_scores["right"]["vehicle"], 0.30)
+        self.assertEqual(smoothed.active_events_by_direction["right"], ["vehicle"])
+
+    def test_smoothing_still_weights_non_temporal_events(self):
+        first = SimpleNamespace(
+            sample_rate=48_000,
+            direction_event_scores={"right": {"footstep": 0.90}},
+            active_events_by_direction={"right": ["footstep"]},
+            top_labels_by_direction={},
+        )
+        second = SimpleNamespace(
+            sample_rate=48_000,
+            direction_event_scores={"right": {"footstep": 0.0}},
+            active_events_by_direction={"right": []},
+            top_labels_by_direction={},
+        )
+
+        smoothed = event_detection.smooth_direction_event_predictions([first, second], window=2)
+
+        self.assertAlmostEqual(smoothed.direction_event_scores["right"]["footstep"], 0.30)
+        self.assertEqual(smoothed.active_events_by_direction["right"], ["footstep"])
 
 
 if __name__ == "__main__":

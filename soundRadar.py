@@ -64,7 +64,12 @@ from sound_model.event_detection import (
     spatially_allowed_gunshot_directions as _spatially_allowed_gunshot_directions,
     suppress_displayed_events_for_direction,
 )
-from sound_model.direction_runtime import DirectionEventRuntime as _DirectionEventRuntime
+from sound_model.direction_runtime import (
+    DEFAULT_INTERVAL_SECONDS,
+    DEFAULT_WINDOW_SECONDS,
+    DirectionEventRuntime as _DirectionEventRuntime,
+    normalize_analysis_timing,
+)
 from sound_model.radar_directions import (
     CENTER,
     DEFAULT_DIRECTIONAL_MIN_RATIO,
@@ -159,8 +164,8 @@ AST_DIRECTION_EVENT_TEACHER_MODEL = "efficientat-mn20"
 # efficientat-mn10 efficientat-mn20 ast
 AST_DIRECTION_EVENT_MODEL_ID = None
 AST_DIRECTION_EVENT_TOP_K = 5
-AST_DIRECTION_EVENT_WINDOW_SECONDS = 1.0
-AST_DIRECTION_EVENT_INTERVAL = 1.25
+AST_DIRECTION_EVENT_WINDOW_SECONDS = DEFAULT_WINDOW_SECONDS
+AST_DIRECTION_EVENT_INTERVAL = DEFAULT_INTERVAL_SECONDS
 AST_DIRECTION_EVENT_THRESHOLD = DEFAULT_DIRECTION_EVENT_THRESHOLD
 AST_DIRECTION_EVENT_COOLDOWN = DEFAULT_DIRECTION_EVENT_COOLDOWN
 AST_DIRECTION_EVENT_WARMUP = True
@@ -334,6 +339,10 @@ def apply_runtime_config(config):
         AST_DIRECTION_EVENT_WINDOW_SECONDS = _config_float(config["window_seconds"], "window_seconds")
     if "interval_seconds" in config:
         AST_DIRECTION_EVENT_INTERVAL = _config_float(config["interval_seconds"], "interval_seconds")
+    AST_DIRECTION_EVENT_WINDOW_SECONDS, AST_DIRECTION_EVENT_INTERVAL = normalize_analysis_timing(
+        AST_DIRECTION_EVENT_WINDOW_SECONDS,
+        AST_DIRECTION_EVENT_INTERVAL,
+    )
     if "warmup" in config:
         AST_DIRECTION_EVENT_WARMUP = _config_bool(config["warmup"], "warmup")
     if "rolling_capture_enabled" in config:

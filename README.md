@@ -158,6 +158,9 @@ paths. The file is ignored by git, so switching between `ast` and
 `efficientat-mn20` no longer requires editing `soundRadar.py`. Visual tuning can
 also live there: `event_icon_scale`, `event_icon_opacity`,
 `event_icon_labels`, `event_smoothing_enabled`, and `event_smoothing_window`.
+The default live analysis uses a 1.0 second window every 0.5 seconds. If a
+local `interval_seconds` exceeds `window_seconds`, SoundRadar caps the interval
+to the window length so no audio interval is skipped.
 
 Threshold/cooldown tuning can be selected without editing code:
 

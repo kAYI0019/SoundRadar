@@ -8,13 +8,27 @@ import time
 
 import numpy as np
 
+from .event_temporal_state import EventTemporalState
+
 
 DEFAULT_WINDOW_SECONDS = 1.0
-DEFAULT_INTERVAL_SECONDS = 1.25
+DEFAULT_INTERVAL_SECONDS = 0.50
 DEFAULT_TOP_K = 5
 DEFAULT_DEVICE = "auto"
 DEFAULT_DTYPE = "auto"
 DEFAULT_TEACHER_MODEL = "efficientat-mn20"
+
+
+def normalize_analysis_timing(window_seconds: float, interval_seconds: float) -> tuple[float, float]:
+    """Return positive timing with interval capped to prevent unanalyzed gaps."""
+
+    window_seconds = float(window_seconds)
+    interval_seconds = float(interval_seconds)
+    if window_seconds <= 0.0:
+        raise ValueError("window_seconds must be positive")
+    if interval_seconds < 0.0:
+        raise ValueError("interval_seconds must be non-negative")
+    return window_seconds, min(interval_seconds, window_seconds)
 
 
 class DirectionEventRuntime:
@@ -36,13 +50,19 @@ class DirectionEventRuntime:
         executor=None,
         score_fn=None,
         latency_clock=None,
+        temporal_state=None,
         warmup=True,
     ):
         self.sample_rate = int(sample_rate)
         self.channel_count = int(channel_count)
-        self.window_seconds = float(window_seconds)
+        requested_interval_seconds = float(interval_seconds)
+        self.window_seconds, self.interval_seconds = normalize_analysis_timing(
+            window_seconds,
+            requested_interval_seconds,
+        )
         self.max_samples = max(1, int(self.sample_rate * self.window_seconds))
-        self.interval_seconds = float(interval_seconds)
+        self.requested_interval_seconds = requested_interval_seconds
+        self.interval_was_capped = self.interval_seconds != self.requested_interval_seconds
         self.top_k = int(top_k)
         self.device = device
         self.dtype = dtype
@@ -57,6 +77,7 @@ class DirectionEventRuntime:
             thread_name_prefix="soundradar-ast",
         )
         self._latency_clock = latency_clock or time.perf_counter
+        self._temporal_state = temporal_state if temporal_state is not None else EventTemporalState()
         self._future = None
         self._future_capture_time = None
         self._teacher = None
@@ -66,6 +87,8 @@ class DirectionEventRuntime:
         self.latest_audio_capture_time = None
         self.latest_latency_ms = None
         self.latest_prediction = None
+        self.submitted_inference_count = 0
+        self.busy_skip_count = 0
         self.disabled_reason = None
         self.resolved_device = None
         self.resolved_dtype = None
@@ -96,6 +119,8 @@ class DirectionEventRuntime:
             return None
         try:
             self.latest_prediction = self._future.result()
+            if hasattr(self.latest_prediction, "direction_event_scores"):
+                self.latest_prediction = self._temporal_state.apply(self.latest_prediction)
             if self._future_capture_time is not None:
                 self.latest_latency_ms = max(
                     0.0,
@@ -127,7 +152,11 @@ class DirectionEventRuntime:
     def maybe_submit(self, now):
         prediction = self.poll()
         self.poll_warmup()
-        if self.disabled_reason is not None or self._future is not None or self._warmup_future is not None:
+        if self.disabled_reason is not None or self._warmup_future is not None:
+            return prediction
+        if self._future is not None:
+            if now - self._last_submit_time >= self.interval_seconds:
+                self.busy_skip_count += 1
             return prediction
         if self._audio.shape[0] < self.max_samples:
             return prediction
@@ -143,6 +172,7 @@ class DirectionEventRuntime:
             self.top_k,
             "<live>",
         )
+        self.submitted_inference_count += 1
         return self.poll() if self._future.done() else prediction
 
     def _ensure_ast_teacher(self):

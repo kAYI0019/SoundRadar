@@ -89,6 +89,8 @@ class SmoothedDirectionEventPrediction:
     source_path: str | None = None
     mode: str = "smoothed direction-event inference"
     raw_direction_event_scores: dict = field(default_factory=dict)
+    resolver_direction_event_scores: dict = field(default_factory=dict)
+    temporal_direction_event_scores: dict = field(default_factory=dict)
     event_label_evidence_by_direction: dict = field(default_factory=dict)
     vehicle_gun_evidence_by_direction: dict = field(default_factory=dict)
     vehicle_gun_decisions_by_direction: dict = field(default_factory=dict)
@@ -114,6 +116,8 @@ class SmoothedDirectionEventPrediction:
             "active_events_by_direction": self.active_events_by_direction,
             "top_labels_by_direction": self.top_labels_by_direction,
             "raw_direction_event_scores": self.raw_direction_event_scores,
+            "resolver_direction_event_scores": self.resolver_direction_event_scores,
+            "temporal_direction_event_scores": self.temporal_direction_event_scores,
             "event_label_evidence_by_direction": self.event_label_evidence_by_direction,
             "vehicle_gun_evidence_by_direction": resolver_evidence,
             "vehicle_gun_decisions_by_direction": resolver_decisions,
@@ -429,13 +433,28 @@ def smooth_direction_event_predictions(predictions, *, window=DEFAULT_SMOOTHING_
         for prediction in valid:
             active_union.update((getattr(prediction, "active_events_by_direction", {}) or {}).get(direction, ()) or ())
         for event_name in event_names:
-            weighted_score = 0.0
-            for weight, prediction in zip(weights, valid):
-                scores = (getattr(prediction, "direction_event_scores", {}) or {}).get(direction, {}) or {}
-                weighted_score += float(weight) * clamp(float(scores.get(event_name, 0.0)))
-            direction_scores[event_name] = weighted_score / weight_sum
+            if event_name in ("gunshot", "vehicle"):
+                latest_scores = (getattr(latest, "direction_event_scores", {}) or {}).get(direction, {}) or {}
+                direction_scores[event_name] = clamp(float(latest_scores.get(event_name, 0.0)))
+            else:
+                weighted_score = 0.0
+                for weight, prediction in zip(weights, valid):
+                    scores = (getattr(prediction, "direction_event_scores", {}) or {}).get(direction, {}) or {}
+                    weighted_score += float(weight) * clamp(float(scores.get(event_name, 0.0)))
+                direction_scores[event_name] = weighted_score / weight_sum
         smoothed_scores[direction] = direction_scores
-        smoothed_active[direction] = [event_name for event_name in DIRECTION_EVENT_PRIORITY if event_name in active_union]
+        latest_active = set(
+            (getattr(latest, "active_events_by_direction", {}) or {}).get(direction, ()) or ()
+        )
+        smoothed_active[direction] = [
+            event_name
+            for event_name in DIRECTION_EVENT_PRIORITY
+            if (
+                event_name in latest_active
+                if event_name in ("gunshot", "vehicle")
+                else event_name in active_union
+            )
+        ]
 
     return SmoothedDirectionEventPrediction(
         sample_rate=int(getattr(latest, "sample_rate", 0) or 0),
@@ -444,6 +463,12 @@ def smooth_direction_event_predictions(predictions, *, window=DEFAULT_SMOOTHING_
         top_labels_by_direction=dict(getattr(latest, "top_labels_by_direction", {}) or {}),
         source_path=getattr(latest, "source_path", None),
         raw_direction_event_scores=dict(getattr(latest, "raw_direction_event_scores", {}) or {}),
+        resolver_direction_event_scores=dict(
+            getattr(latest, "resolver_direction_event_scores", {}) or {}
+        ),
+        temporal_direction_event_scores=dict(
+            getattr(latest, "temporal_direction_event_scores", {}) or {}
+        ),
         event_label_evidence_by_direction=dict(getattr(latest, "event_label_evidence_by_direction", {}) or {}),
         vehicle_gun_evidence_by_direction=dict(getattr(latest, "vehicle_gun_evidence_by_direction", {}) or {}),
         vehicle_gun_decisions_by_direction=dict(getattr(latest, "vehicle_gun_decisions_by_direction", {}) or {}),
