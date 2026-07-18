@@ -32,11 +32,13 @@ There is no separate canonical lint/build command in this repo at the moment. Fo
   - `apply_windows_overlay_level(widget)` uses Win32 `SetWindowLongPtrW` + `SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE)`.
 
 - **Geometry/drawing**
+  - `sound_model/radar_visuals.py` owns Qt-free pulse lifecycle, icon coordinate, and watercolor blob geometry helpers; `soundRadar.py` converts their results into Qt drawing types.
   - `arc_start_deg_for_position(position)` maps clock-like radar sectors to `QPainter.drawArc()` degrees.
   - Expected cardinal checks: `{0: 75, 3: -15, 6: -105, 9: 165}`.
   - `fitted_window_size()` keeps the square overlay within 90% of the active screen's smallest dimension.
 
 - **Audio/channel semantics**
+  - `sound_model/radar_directions.py` owns the pure channel-mapping and sector-level helpers; `soundRadar.py` re-exports the legacy names.
   - `build_channel_mapping(channel_count, output_channel_count=None)` chooses 7.1 vs stereo/mono fallback mapping.
   - 7.1 mapping used by this app:
     - `avg` front-left: channel 0
@@ -49,6 +51,16 @@ There is no separate canonical lint/build command in this repo at the moment. Fo
     - `ard` rear-right: channel 7
   - `compute_direction_levels(max_values, channel_map)` converts channel peaks into the 12 visual sectors.
   - `centered_pair_strength(first, second)` prevents one-sided rear/front channels from also lighting center.
+
+- **Event display semantics**
+  - `sound_model/event_detection.py` owns pure event selection, gunshot spatial suppression, prediction smoothing, and pulse creation.
+  - `sound_model/event_debug.py` owns Qt-free HUD formatting for device, latency, compass scores, and suppression/cooldown state.
+  - `sound_model/direction_runtime.py` owns Qt-free audio-window buffering, asynchronous teacher inference, warmup, and model-latency tracking.
+  - `soundRadar.py` keeps compatibility wrappers that pass the current runtime threshold profile into those helpers.
+
+- **Rolling capture**
+  - `sound_model/rolling_capture.py` owns the Qt-free recent-audio buffer, WAV/metadata writing, and trigger-file helpers.
+  - `soundRadar.py` keeps compatibility wrappers that supply the current capture directory, trigger path, threshold profile, and HUD summary.
 
 ## Cross-platform overlay rules
 
@@ -107,7 +119,7 @@ The implementation is guarded so it only executes on `sys.platform == "win32"`.
 - The visual layer converts meaningful sector levels into short-lived `SoundPulse` events.
 - `SoundPulse.kind` is intentionally basic for now (`unknown`, `sharp`, `impact`) so future agents can attach footstep/gunfire/vehicle classification later without changing the renderer API.
 - Ripples should stay in the outer screen region and expand outward. Preserve the center safe zone for aiming/gameplay focus.
-- Current default ripple style is `RIPPLE_STYLE="watercolor"`: render pulses as multiple soft `WatercolorBlob` radial-gradient ellipses rather than hard `drawArc()` ripple lines. Keep the blob math in `watercolor_blob_specs(...)` deterministic so tests can verify stable shapes that move outward and fade.
+- Current default ripple style is `RIPPLE_STYLE="watercolor"`: render pulses as multiple soft `WatercolorBlob` radial-gradient ellipses rather than hard `drawArc()` ripple lines. Keep the blob math in `sound_model/radar_visuals.py` deterministic so tests can verify stable shapes that move outward and fade without importing Qt.
 - Keep `SHOW_ARCS=True` as a faint/debug baseline until the user explicitly approves ripple-only mode.
 - Use per-sector cooldown (`RIPPLE_COOLDOWN`) and threshold (`RIPPLE_THRESHOLD`) to avoid visual spam from sustained sound.
 - Do not tie animation directly to raw channel values; use pulse lifecycle helpers (`pulse_opacity`, `pulse_ripple_radius`, `pulse_expired`) so visuals remain stable and testable.

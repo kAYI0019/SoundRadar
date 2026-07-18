@@ -1,4 +1,3 @@
-import concurrent.futures
 import ctypes
 import ctypes.util
 from dataclasses import dataclass
@@ -7,7 +6,6 @@ import math
 import os
 from pathlib import Path
 import queue
-import random
 import sys
 import time
 
@@ -15,15 +13,102 @@ import numpy as np
 import sounddevice as sd
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-
-RADAR_SECTORS = 12
-FRONT_LEFT = "avg"
-FRONT_RIGHT = "avd"
-CENTER = "c"
-LEFT = "g"
-RIGHT = "d"
-REAR_LEFT = "arg"
-REAR_RIGHT = "ard"
+from sound_model.event_debug import (
+    DIRECTION_DEBUG_LABELS,
+    EVENT_DEBUG_LABELS,
+    DirectionEventDebugConfig,
+    compact_score as _compact_score,
+    direction_event_debug_cell as _direction_event_debug_cell,
+    direction_event_debug_header as _direction_event_debug_header,
+    direction_event_debug_lines as _direction_event_debug_lines,
+    direction_event_device_label as _direction_event_device_label,
+    direction_event_gunshot_debug_line as _direction_event_gunshot_debug_line,
+    direction_latency_debug_line as _direction_latency_debug_line,
+    format_latency_ms as _format_latency_ms,
+)
+from sound_model.event_detection import (
+    CLASSIFIED_EVENT_KINDS,
+    DEFAULT_DIRECTION_EVENT_COOLDOWN,
+    DEFAULT_DIRECTION_EVENT_DISPLAY_THRESHOLDS,
+    DEFAULT_DIRECTION_EVENT_SECONDARY_THRESHOLDS,
+    DEFAULT_DIRECTION_EVENT_THRESHOLD,
+    DEFAULT_EVENT_ICON_DURATION,
+    DEFAULT_GUNSHOT_BIAS_MARGIN,
+    DEFAULT_GUNSHOT_GLOBAL_COOLDOWN,
+    DEFAULT_GUNSHOT_MAX_DIRECTIONS,
+    DEFAULT_MAX_EVENTS_PER_DIRECTION,
+    DEFAULT_RIPPLE_COOLDOWN,
+    DEFAULT_RIPPLE_DURATION,
+    DEFAULT_RIPPLE_THRESHOLD,
+    DEFAULT_SMOOTHING_WINDOW,
+    DIRECTION_EVENT_ORDER,
+    DIRECTION_EVENT_ORDER_INDEX,
+    DIRECTION_EVENT_PRIORITY,
+    DIRECTION_EVENT_SECTORS,
+    GUNSHOT_DIRECTION_NEIGHBORS,
+    DirectionEventPulseDebug,
+    GunshotDisplayDecision,
+    SmoothedDirectionEventPrediction,
+    SoundPulse,
+    active_event_candidates as _active_event_candidates,
+    classify_basic_sound_event,
+    create_pulses_from_direction_events as _create_pulses_from_direction_events,
+    create_pulses_from_levels as _create_pulses_from_levels,
+    displayed_active_events as _displayed_active_events,
+    dominant_active_event as _dominant_active_event,
+    event_display_threshold,
+    gunshot_candidate_scores as _gunshot_candidate_scores,
+    gunshot_display_decision as _gunshot_display_decision,
+    should_emit_pulse,
+    smooth_direction_event_predictions as _smooth_direction_event_predictions,
+    spatially_allowed_gunshot_directions as _spatially_allowed_gunshot_directions,
+    suppress_displayed_events_for_direction,
+)
+from sound_model.direction_runtime import DirectionEventRuntime as _DirectionEventRuntime
+from sound_model.radar_directions import (
+    CENTER,
+    DEFAULT_DIRECTIONAL_MIN_RATIO,
+    FRONT_LEFT,
+    FRONT_RIGHT,
+    LEFT,
+    RADAR_SECTORS,
+    REAR_LEFT,
+    REAR_RIGHT,
+    RIGHT,
+    arc_start_deg_for_position,
+    build_channel_mapping,
+    centered_pair_strength,
+    compute_direction_levels as _compute_direction_levels,
+    directional_difference as _directional_difference,
+    mapped_channel_value,
+    positive_difference,
+)
+from sound_model.radar_visuals import (
+    WatercolorBlob,
+    event_icon_center_xy as _event_icon_center_xy,
+    event_icon_opacity as _event_icon_opacity,
+    event_icon_size as _event_icon_size,
+    normalize_degrees,
+    pulse_age_ratio,
+    pulse_expired,
+    pulse_opacity,
+    pulse_ripple_radius,
+    sector_mid_angle_deg,
+    watercolor_blob_specs as _watercolor_blob_specs,
+    watercolor_color_level,
+    watercolor_pulse_seed,
+)
+from sound_model.rolling_capture import (
+    RollingAudioCapture,
+    RollingCaptureSnapshot,
+    TimedAudioBlock,
+    consume_rolling_capture_trigger as _consume_rolling_capture_trigger,
+    rolling_capture_metadata_path as _rolling_capture_metadata_path,
+    rolling_capture_metadata_payload as _rolling_capture_metadata_payload,
+    rolling_capture_output_path as _rolling_capture_output_path,
+    write_rolling_capture_snapshot as _write_rolling_capture_snapshot,
+    write_rolling_capture_trigger as _write_rolling_capture_trigger,
+)
 
 # GLOBAL PARAMETERS (kept as simple module settings for easy tuning)
 n_chans = 8
@@ -33,7 +118,7 @@ maxSoundValue = 1.0  # float32 streams are normalized to -1.0..1.0
 STRENGTH_MODE = 2
 minTFU = 0.5  # minimum Time needed for First Update (upper sound value)
 minTBU = 0.1  # minimum Time needed Between Update (lower sound value)
-maxdifmain = 0.01  # min ratio difference between paired directional channels
+maxdifmain = DEFAULT_DIRECTIONAL_MIN_RATIO  # min ratio difference between paired directional channels
 maxColorRange = 255
 minThreshold = 0.005
 prevmax = np.zeros(RADAR_SECTORS)
@@ -48,9 +133,9 @@ ARC_MIN_VISIBLE_STRENGTH = 0.02
 SHOW_ARCS = True
 SHOW_RIPPLES = True
 RIPPLE_STYLE = "watercolor"
-RIPPLE_THRESHOLD = 0.03
-RIPPLE_COOLDOWN = 0.18
-RIPPLE_DURATION = 0.65
+RIPPLE_THRESHOLD = DEFAULT_RIPPLE_THRESHOLD
+RIPPLE_COOLDOWN = DEFAULT_RIPPLE_COOLDOWN
+RIPPLE_DURATION = DEFAULT_RIPPLE_DURATION
 MAX_ACTIVE_PULSES = 72
 WATERCOLOR_BLOBS = 7
 WATERCOLOR_ANGLE_SPREAD = 26.0
@@ -76,34 +161,24 @@ AST_DIRECTION_EVENT_MODEL_ID = None
 AST_DIRECTION_EVENT_TOP_K = 5
 AST_DIRECTION_EVENT_WINDOW_SECONDS = 1.0
 AST_DIRECTION_EVENT_INTERVAL = 1.25
-AST_DIRECTION_EVENT_THRESHOLD = 0.10
-AST_DIRECTION_EVENT_COOLDOWN = 0.55
+AST_DIRECTION_EVENT_THRESHOLD = DEFAULT_DIRECTION_EVENT_THRESHOLD
+AST_DIRECTION_EVENT_COOLDOWN = DEFAULT_DIRECTION_EVENT_COOLDOWN
 AST_DIRECTION_EVENT_WARMUP = True
 SHOW_EVENT_DEBUG_TEXT = True
 EVENT_DEBUG_MAX_LINES = 7
-DIRECTION_EVENT_GUNSHOT_DISPLAY_THRESHOLD = 0.10
-DIRECTION_EVENT_GUNSHOT_SECONDARY_THRESHOLD = 0.35
-DIRECTION_EVENT_DISPLAY_THRESHOLDS = {
-    "gunshot": DIRECTION_EVENT_GUNSHOT_DISPLAY_THRESHOLD,
-    "explosion": 0.85,
-    "vehicle": 0.60,
-    "footstep": 0.85,
-}
-DIRECTION_EVENT_SECONDARY_DISPLAY_THRESHOLDS = {
-    "gunshot": DIRECTION_EVENT_GUNSHOT_SECONDARY_THRESHOLD,
-    "explosion": 0.85,
-    "vehicle": 0.60,
-    "footstep": 0.85,
-}
-DIRECTION_EVENT_GUNSHOT_BIAS_MARGIN = 0.25
-DIRECTION_EVENT_MAX_ICONS_PER_DIRECTION = 2
+DIRECTION_EVENT_DISPLAY_THRESHOLDS = dict(DEFAULT_DIRECTION_EVENT_DISPLAY_THRESHOLDS)
+DIRECTION_EVENT_SECONDARY_DISPLAY_THRESHOLDS = dict(DEFAULT_DIRECTION_EVENT_SECONDARY_THRESHOLDS)
+DIRECTION_EVENT_GUNSHOT_DISPLAY_THRESHOLD = DIRECTION_EVENT_DISPLAY_THRESHOLDS["gunshot"]
+DIRECTION_EVENT_GUNSHOT_SECONDARY_THRESHOLD = DIRECTION_EVENT_SECONDARY_DISPLAY_THRESHOLDS["gunshot"]
+DIRECTION_EVENT_GUNSHOT_BIAS_MARGIN = DEFAULT_GUNSHOT_BIAS_MARGIN
+DIRECTION_EVENT_MAX_ICONS_PER_DIRECTION = DEFAULT_MAX_EVENTS_PER_DIRECTION
 DIRECTION_EVENT_SMOOTHING_ENABLED = True
-DIRECTION_EVENT_SMOOTHING_WINDOW = 3
+DIRECTION_EVENT_SMOOTHING_WINDOW = DEFAULT_SMOOTHING_WINDOW
 
 # Gunshot direction tuning: keep detection permissive, then suppress spatial
 # bleed and rapid repeats at display time so distant shots are still visible.
-GUNSHOT_SPATIAL_MAX_DIRECTIONS = 2
-GUNSHOT_GLOBAL_COOLDOWN = 0.18
+GUNSHOT_SPATIAL_MAX_DIRECTIONS = DEFAULT_GUNSHOT_MAX_DIRECTIONS
+GUNSHOT_GLOBAL_COOLDOWN = DEFAULT_GUNSHOT_GLOBAL_COOLDOWN
 
 ROLLING_CAPTURE_ENABLED = True
 ROLLING_CAPTURE_SECONDS = 5.0
@@ -421,29 +496,7 @@ def apply_threshold_profile(name=None):
     return profile
 
 
-DIRECTION_EVENT_SECTORS = {
-    "front_left": 11,
-    "front": 0,
-    "front_right": 1,
-    "left": 9,
-    "right": 3,
-    "rear_left": 7,
-    "rear_right": 5,
-}
-DIRECTION_EVENT_ORDER = tuple(DIRECTION_EVENT_SECTORS)
-DIRECTION_EVENT_ORDER_INDEX = {direction: index for index, direction in enumerate(DIRECTION_EVENT_ORDER)}
-DIRECTION_EVENT_PRIORITY = ("explosion", "gunshot", "vehicle", "footstep")
-CLASSIFIED_EVENT_KINDS = frozenset(DIRECTION_EVENT_PRIORITY)
-GUNSHOT_DIRECTION_NEIGHBORS = {
-    "front_left": frozenset(("front", "left")),
-    "front": frozenset(("front_left", "front_right")),
-    "front_right": frozenset(("front", "right")),
-    "left": frozenset(("front_left", "rear_left")),
-    "right": frozenset(("front_right", "rear_right")),
-    "rear_left": frozenset(("left", "rear_right")),
-    "rear_right": frozenset(("right", "rear_left")),
-}
-EVENT_ICON_DURATION = 3.5
+EVENT_ICON_DURATION = DEFAULT_EVENT_ICON_DURATION
 EVENT_ICON_HOLD_AGE_RATIO = 0.68
 EVENT_ICON_DISTANCE_RATIO = 0.40
 EVENT_ICON_STACK_SPACING_RATIO = 0.052
@@ -469,174 +522,11 @@ EVENT_ICON_LABELS = {
     "vehicle": "CAR",
     "footstep": "STEP",
 }
-EVENT_DEBUG_LABELS = {
-    "explosion": "EXP",
-    "gunshot": "GUN",
-    "vehicle": "VEH",
-    "footstep": "FOOT",
-}
-DIRECTION_DEBUG_LABELS = {
-    "front_left": "FL",
-    "front": "F",
-    "front_right": "FR",
-    "left": "L",
-    "right": "R",
-    "rear_left": "RL",
-    "rear_right": "RR",
-}
-
 q = queue.Queue()
 
 
 def clamp(value, low=0.0, high=1.0):
     return max(low, min(high, value))
-
-
-@dataclass
-class SoundPulse:
-    sector: int
-    strength: float
-    created_at: float
-    duration: float = RIPPLE_DURATION
-    kind: str = "unknown"
-    lane_index: int = 0
-    lane_count: int = 1
-
-
-@dataclass(frozen=True)
-class TimedAudioBlock:
-    samples: object
-    captured_at: float
-
-
-@dataclass(frozen=True)
-class RollingCaptureSnapshot:
-    audio: object
-    sample_rate: int
-    channel_count: int
-    start_capture_time: float | None = None
-    end_capture_time: float | None = None
-
-
-class RollingAudioCapture:
-    def __init__(self, sample_rate, channel_count, seconds=ROLLING_CAPTURE_SECONDS):
-        self.sample_rate = int(sample_rate)
-        self.channel_count = int(channel_count)
-        self.seconds = float(seconds)
-        self.max_samples = max(1, int(round(self.sample_rate * self.seconds)))
-        self._audio = np.zeros((0, self.channel_count), dtype=np.float32)
-        self.end_capture_time = None
-
-    def append_blocks(self, blocks, capture_time=None):
-        prepared = []
-        for block in blocks:
-            audio = np.asarray(block, dtype=np.float32)
-            if audio.ndim == 1:
-                audio = audio[:, None]
-            if audio.ndim != 2 or audio.shape[0] == 0:
-                continue
-            if audio.shape[1] < self.channel_count:
-                padded = np.zeros((audio.shape[0], self.channel_count), dtype=np.float32)
-                padded[:, : audio.shape[1]] = audio
-                audio = padded
-            prepared.append(audio[:, : self.channel_count])
-        if prepared:
-            self._audio = np.concatenate([self._audio, *prepared], axis=0)[-self.max_samples :]
-            if capture_time is not None:
-                self.end_capture_time = float(capture_time)
-
-    def snapshot(self):
-        audio = np.array(self._audio, copy=True)
-        if self.end_capture_time is None:
-            start_capture_time = None
-        else:
-            start_capture_time = self.end_capture_time - (audio.shape[0] / float(self.sample_rate))
-        return RollingCaptureSnapshot(
-            audio=audio,
-            sample_rate=self.sample_rate,
-            channel_count=self.channel_count,
-            start_capture_time=start_capture_time,
-            end_capture_time=self.end_capture_time,
-        )
-
-
-@dataclass(frozen=True)
-class WatercolorBlob:
-    angle_deg: float
-    distance: float
-    radius: float
-    opacity: float
-    stretch: float = 1.0
-    rotation_deg: float = 0.0
-    flow_deg: float = 0.0
-
-
-@dataclass(frozen=True)
-class GunshotDisplayDecision:
-    candidate_scores: tuple
-    allowed_directions: frozenset
-    spatially_suppressed_directions: frozenset
-
-
-@dataclass(frozen=True)
-class DirectionEventPulseDebug:
-    gunshot_decision: GunshotDisplayDecision
-    gunshot_emitted_directions: tuple
-    gunshot_global_cooldown_blocked_directions: tuple
-    gunshot_sector_cooldown_blocked_directions: tuple
-
-
-@dataclass
-class SmoothedDirectionEventPrediction:
-    sample_rate: int
-    direction_event_scores: dict
-    active_events_by_direction: dict
-    top_labels_by_direction: dict
-    source_path: str | None = None
-    mode: str = "smoothed direction-event inference"
-
-    def to_jsonable(self):
-        return {
-            "source_path": self.source_path,
-            "sample_rate": self.sample_rate,
-            "mode": self.mode,
-            "directions": list(DIRECTION_EVENT_SECTORS),
-            "classes": sorted({event for scores in self.direction_event_scores.values() for event in scores}),
-            "direction_event_scores": self.direction_event_scores,
-            "active_events_by_direction": self.active_events_by_direction,
-            "top_labels_by_direction": self.top_labels_by_direction,
-        }
-
-
-def pulse_age_ratio(pulse, now):
-    if pulse.duration <= 0:
-        return 1.0
-    return clamp((now - pulse.created_at) / pulse.duration)
-
-
-def pulse_opacity(pulse, now):
-    age = pulse_age_ratio(pulse, now)
-    if age >= 1.0:
-        return 0.0
-    return clamp(pulse.strength) * ((1.0 - age) ** 1.5)
-
-
-def pulse_expired(pulse, now):
-    return pulse_age_ratio(pulse, now) >= 1.0
-
-
-def classify_basic_sound_event(strength, previous_strength=0.0):
-    strength = clamp(float(strength))
-    previous_strength = clamp(float(previous_strength))
-    if strength >= 0.85:
-        return "impact"
-    if strength - previous_strength >= 0.25:
-        return "sharp"
-    return "unknown"
-
-
-def should_emit_pulse(last_time, now, cooldown=RIPPLE_COOLDOWN):
-    return now - last_time >= cooldown
 
 
 def create_pulses_from_levels(
@@ -647,29 +537,15 @@ def create_pulses_from_levels(
     last_pulse_times=None,
     previous_levels=None,
 ):
-    pulses = []
-    levels = np.asarray(levels)
-    if previous_levels is None:
-        previous_levels = np.zeros_like(levels)
-    for sector, strength in enumerate(levels):
-        strength = float(strength)
-        if strength < threshold:
-            continue
-        if last_pulse_times is not None and not should_emit_pulse(last_pulse_times[sector], now, cooldown):
-            continue
-        previous_strength = float(previous_levels[sector]) if sector < len(previous_levels) else 0.0
-        pulses.append(
-            SoundPulse(
-                sector=sector,
-                strength=clamp(strength),
-                created_at=now,
-                duration=RIPPLE_DURATION,
-                kind=classify_basic_sound_event(strength, previous_strength),
-            )
-        )
-        if last_pulse_times is not None:
-            last_pulse_times[sector] = now
-    return pulses
+    return _create_pulses_from_levels(
+        levels,
+        now,
+        threshold,
+        cooldown,
+        last_pulse_times,
+        previous_levels,
+        pulse_duration=RIPPLE_DURATION,
+    )
 
 
 def dominant_active_event(
@@ -678,30 +554,13 @@ def dominant_active_event(
     threshold=AST_DIRECTION_EVENT_THRESHOLD,
     event_thresholds=DIRECTION_EVENT_DISPLAY_THRESHOLDS,
 ):
-    active = set(active_events or [])
-    best_event = None
-    best_score = 0.0
-    gunshot_score = clamp(float(scores.get("gunshot", 0.0)))
-    gunshot_threshold = max(float(threshold), float(event_thresholds.get("gunshot", threshold)))
-    for event_name in DIRECTION_EVENT_PRIORITY:
-        score = clamp(float(scores.get(event_name, 0.0)))
-        event_threshold = max(float(threshold), float(event_thresholds.get(event_name, threshold)))
-        if score >= event_threshold and (not active or event_name in active):
-            if best_event is None or score > best_score:
-                best_event = event_name
-                best_score = score
-    if (
-        best_event in ("explosion", "footstep")
-        and gunshot_score >= gunshot_threshold
-        and (not active or "gunshot" in active)
-        and best_score - gunshot_score <= DIRECTION_EVENT_GUNSHOT_BIAS_MARGIN
-    ):
-        return "gunshot", gunshot_score
-    return best_event, best_score
-
-
-def event_display_threshold(event_name, threshold, event_thresholds):
-    return max(float(threshold), float(event_thresholds.get(event_name, threshold)))
+    return _dominant_active_event(
+        scores,
+        active_events,
+        threshold,
+        event_thresholds,
+        gunshot_bias_margin=DIRECTION_EVENT_GUNSHOT_BIAS_MARGIN,
+    )
 
 
 def active_event_candidates(
@@ -710,13 +569,7 @@ def active_event_candidates(
     threshold=AST_DIRECTION_EVENT_THRESHOLD,
     event_thresholds=DIRECTION_EVENT_DISPLAY_THRESHOLDS,
 ):
-    active = set(active_events or [])
-    candidates = []
-    for event_name in DIRECTION_EVENT_PRIORITY:
-        score = clamp(float(scores.get(event_name, 0.0)))
-        if score >= event_display_threshold(event_name, threshold, event_thresholds) and (not active or event_name in active):
-            candidates.append((event_name, score))
-    return candidates
+    return _active_event_candidates(scores, active_events, threshold, event_thresholds)
 
 
 def displayed_active_events(
@@ -727,66 +580,14 @@ def displayed_active_events(
     secondary_thresholds=DIRECTION_EVENT_SECONDARY_DISPLAY_THRESHOLDS,
     max_events=DIRECTION_EVENT_MAX_ICONS_PER_DIRECTION,
 ):
-    candidates = active_event_candidates(scores, active_events, threshold, event_thresholds)
-    if not candidates:
-        return []
-
-    primary_event, primary_score = dominant_active_event(scores, active_events, threshold, event_thresholds)
-    ordered = []
-    if primary_event is not None:
-        ordered.append((primary_event, primary_score))
-
-    for event_name, score in sorted(candidates, key=lambda item: item[1], reverse=True):
-        if event_name == primary_event:
-            continue
-        if primary_event == "vehicle" and event_name == "gunshot":
-            continue
-        if score >= event_display_threshold(event_name, threshold, secondary_thresholds):
-            ordered.append((event_name, score))
-        if len(ordered) >= int(max_events):
-            break
-    return ordered[: int(max_events)]
-
-
-def _direction_event_is_active(event_name, active_events):
-    active = set(active_events or ())
-    return not active or event_name in active
-
-
-def _event_score_for_direction(scores_by_direction, active_by_direction, direction, event_name, threshold, event_thresholds):
-    scores = scores_by_direction.get(direction, {}) or {}
-    score = clamp(float(scores.get(event_name, 0.0)))
-    if score < event_display_threshold(event_name, threshold, event_thresholds):
-        return None
-    if not _direction_event_is_active(event_name, active_by_direction.get(direction, ())):
-        return None
-    return score
-
-
-def _direction_clusters(directions, neighbors):
-    remaining = set(directions)
-    clusters = []
-    while remaining:
-        start = remaining.pop()
-        cluster = {start}
-        stack = [start]
-        while stack:
-            direction = stack.pop()
-            for neighbor in neighbors.get(direction, ()):
-                if neighbor in remaining:
-                    remaining.remove(neighbor)
-                    cluster.add(neighbor)
-                    stack.append(neighbor)
-        clusters.append(cluster)
-    return clusters
-
-
-def _sorted_direction_scores(scores_by_direction):
-    return tuple(
-        sorted(
-            scores_by_direction.items(),
-            key=lambda item: (-item[1], DIRECTION_EVENT_ORDER_INDEX.get(item[0], len(DIRECTION_EVENT_ORDER))),
-        )
+    return _displayed_active_events(
+        scores,
+        active_events,
+        threshold,
+        event_thresholds,
+        secondary_thresholds,
+        max_events,
+        gunshot_bias_margin=DIRECTION_EVENT_GUNSHOT_BIAS_MARGIN,
     )
 
 
@@ -796,19 +597,7 @@ def gunshot_candidate_scores(
     threshold=AST_DIRECTION_EVENT_THRESHOLD,
     event_thresholds=DIRECTION_EVENT_DISPLAY_THRESHOLDS,
 ):
-    candidate_scores = {}
-    for direction in DIRECTION_EVENT_SECTORS:
-        score = _event_score_for_direction(
-            scores_by_direction,
-            active_by_direction,
-            direction,
-            "gunshot",
-            threshold,
-            event_thresholds,
-        )
-        if score is not None:
-            candidate_scores[direction] = score
-    return candidate_scores
+    return _gunshot_candidate_scores(scores_by_direction, active_by_direction, threshold, event_thresholds)
 
 
 def gunshot_display_decision(
@@ -818,43 +607,12 @@ def gunshot_display_decision(
     event_thresholds=DIRECTION_EVENT_DISPLAY_THRESHOLDS,
     max_directions=GUNSHOT_SPATIAL_MAX_DIRECTIONS,
 ):
-    """Return gunshot display candidates and spatial suppression decisions.
-
-    The threshold stays permissive for distant shots, but adjacent directions are
-    clustered and only the local maximum from each cluster is displayed.
-    """
-
-    candidate_scores = gunshot_candidate_scores(
+    return _gunshot_display_decision(
         scores_by_direction,
         active_by_direction,
         threshold,
         event_thresholds,
-    )
-    if len(candidate_scores) <= 1:
-        return GunshotDisplayDecision(
-            candidate_scores=_sorted_direction_scores(candidate_scores),
-            allowed_directions=frozenset(candidate_scores),
-            spatially_suppressed_directions=frozenset(),
-        )
-
-    allowed = []
-    for cluster in _direction_clusters(candidate_scores, GUNSHOT_DIRECTION_NEIGHBORS):
-        winner = max(
-            cluster,
-            key=lambda direction: (
-                candidate_scores[direction],
-                -DIRECTION_EVENT_ORDER_INDEX.get(direction, len(DIRECTION_EVENT_ORDER)),
-            ),
-        )
-        winner_score = candidate_scores[winner]
-        allowed.append((winner, winner_score))
-
-    allowed.sort(key=lambda item: (-item[1], DIRECTION_EVENT_ORDER_INDEX.get(item[0], len(DIRECTION_EVENT_ORDER))))
-    allowed_directions = {direction for direction, _ in allowed[: max(1, int(max_directions))]}
-    return GunshotDisplayDecision(
-        candidate_scores=_sorted_direction_scores(candidate_scores),
-        allowed_directions=frozenset(allowed_directions),
-        spatially_suppressed_directions=frozenset(set(candidate_scores) - allowed_directions),
+        max_directions,
     )
 
 
@@ -865,69 +623,17 @@ def spatially_allowed_gunshot_directions(
     event_thresholds=DIRECTION_EVENT_DISPLAY_THRESHOLDS,
     max_directions=GUNSHOT_SPATIAL_MAX_DIRECTIONS,
 ):
-    return set(
-        gunshot_display_decision(
-            scores_by_direction,
-            active_by_direction,
-            threshold,
-            event_thresholds,
-            max_directions,
-        ).allowed_directions
+    return _spatially_allowed_gunshot_directions(
+        scores_by_direction,
+        active_by_direction,
+        threshold,
+        event_thresholds,
+        max_directions,
     )
-
-
-def suppress_displayed_events_for_direction(direction, events, allowed_gunshot_directions):
-    if direction in allowed_gunshot_directions:
-        return events
-    return [(event_name, score) for event_name, score in events if event_name != "gunshot"]
-
-
-def _prediction_event_names(predictions):
-    names = set(("background", *DIRECTION_EVENT_PRIORITY))
-    for prediction in predictions:
-        scores_by_direction = getattr(prediction, "direction_event_scores", {}) or {}
-        for scores in scores_by_direction.values():
-            names.update((scores or {}).keys())
-    return tuple(sorted(names))
 
 
 def smooth_direction_event_predictions(predictions, *, window=DIRECTION_EVENT_SMOOTHING_WINDOW):
-    valid = [prediction for prediction in predictions if prediction is not None]
-    if not valid:
-        return None
-    window = max(1, int(window))
-    valid = valid[-window:]
-    if len(valid) == 1 or window <= 1:
-        return valid[-1]
-
-    latest = valid[-1]
-    event_names = _prediction_event_names(valid)
-    weights = np.arange(1, len(valid) + 1, dtype=np.float32)
-    weight_sum = float(np.sum(weights))
-    smoothed_scores = {}
-    smoothed_active = {}
-
-    for direction in DIRECTION_EVENT_SECTORS:
-        direction_scores = {}
-        active_union = set()
-        for prediction in valid:
-            active_union.update((getattr(prediction, "active_events_by_direction", {}) or {}).get(direction, ()) or ())
-        for event_name in event_names:
-            weighted_score = 0.0
-            for weight, prediction in zip(weights, valid):
-                scores = (getattr(prediction, "direction_event_scores", {}) or {}).get(direction, {}) or {}
-                weighted_score += float(weight) * clamp(float(scores.get(event_name, 0.0)))
-            direction_scores[event_name] = weighted_score / weight_sum
-        smoothed_scores[direction] = direction_scores
-        smoothed_active[direction] = [event_name for event_name in DIRECTION_EVENT_PRIORITY if event_name in active_union]
-
-    return SmoothedDirectionEventPrediction(
-        sample_rate=int(getattr(latest, "sample_rate", 0) or 0),
-        direction_event_scores=smoothed_scores,
-        active_events_by_direction=smoothed_active,
-        top_labels_by_direction=dict(getattr(latest, "top_labels_by_direction", {}) or {}),
-        source_path=getattr(latest, "source_path", None),
-    )
+    return _smooth_direction_event_predictions(predictions, window=window)
 
 
 def create_pulses_from_direction_events(
@@ -939,112 +645,40 @@ def create_pulses_from_direction_events(
     last_global_event_times=None,
     display_debug=None,
 ):
-    pulses = []
-    scores_by_direction = getattr(prediction, "direction_event_scores", {}) or {}
-    active_by_direction = getattr(prediction, "active_events_by_direction", {}) or {}
-    gunshot_decision = gunshot_display_decision(
-        scores_by_direction,
-        active_by_direction,
+    return _create_pulses_from_direction_events(
+        prediction,
+        now,
         threshold,
+        cooldown,
+        last_pulse_times,
+        last_global_event_times,
+        display_debug,
+        event_thresholds=DIRECTION_EVENT_DISPLAY_THRESHOLDS,
+        secondary_thresholds=DIRECTION_EVENT_SECONDARY_DISPLAY_THRESHOLDS,
+        max_events=DIRECTION_EVENT_MAX_ICONS_PER_DIRECTION,
+        gunshot_bias_margin=DIRECTION_EVENT_GUNSHOT_BIAS_MARGIN,
+        gunshot_max_directions=GUNSHOT_SPATIAL_MAX_DIRECTIONS,
+        gunshot_global_cooldown=GUNSHOT_GLOBAL_COOLDOWN,
+        event_icon_duration=EVENT_ICON_DURATION,
     )
-    allowed_gunshot_directions = set(gunshot_decision.allowed_directions)
-    emitted_gunshot_directions = []
-    global_cooldown_blocked_gunshot_directions = []
-    sector_cooldown_blocked_gunshot_directions = []
-
-    for direction, sector in DIRECTION_EVENT_SECTORS.items():
-        scores = scores_by_direction.get(direction, {})
-        events = displayed_active_events(scores, active_by_direction.get(direction, ()), threshold)
-        events = suppress_displayed_events_for_direction(direction, events, allowed_gunshot_directions)
-        if not events:
-            continue
-        if (
-            last_global_event_times is not None
-            and any(event_name == "gunshot" for event_name, _ in events)
-            and not should_emit_pulse(last_global_event_times.get("gunshot", -float("inf")), now, GUNSHOT_GLOBAL_COOLDOWN)
-        ):
-            global_cooldown_blocked_gunshot_directions.append(direction)
-            events = [(event_name, score) for event_name, score in events if event_name != "gunshot"]
-            if not events:
-                continue
-        if last_pulse_times is not None and not should_emit_pulse(last_pulse_times[sector], now, cooldown):
-            if any(event_name == "gunshot" for event_name, _ in events):
-                sector_cooldown_blocked_gunshot_directions.append(direction)
-            continue
-        lane_count = len(events)
-        for lane_index, (event_name, score) in enumerate(events):
-            pulses.append(
-                SoundPulse(
-                    sector=sector,
-                    strength=score,
-                    created_at=now,
-                    duration=EVENT_ICON_DURATION,
-                    kind=event_name,
-                    lane_index=lane_index,
-                    lane_count=lane_count,
-                )
-            )
-        if last_pulse_times is not None:
-            last_pulse_times[sector] = now
-        if last_global_event_times is not None and any(event_name == "gunshot" for event_name, _ in events):
-            last_global_event_times["gunshot"] = now
-        if any(event_name == "gunshot" for event_name, _ in events):
-            emitted_gunshot_directions.append(direction)
-    if display_debug is not None:
-        display_debug["debug"] = DirectionEventPulseDebug(
-            gunshot_decision=gunshot_decision,
-            gunshot_emitted_directions=tuple(emitted_gunshot_directions),
-            gunshot_global_cooldown_blocked_directions=tuple(global_cooldown_blocked_gunshot_directions),
-            gunshot_sector_cooldown_blocked_directions=tuple(sector_cooldown_blocked_gunshot_directions),
-        )
-    return pulses
 
 
 def compact_score(score):
-    return f"{clamp(float(score)):.2f}".lstrip("0")
+    return _compact_score(score)
 
 
-def _debug_direction_label(direction):
-    return DIRECTION_DEBUG_LABELS.get(direction, str(direction))
-
-
-def _format_debug_direction_list(directions):
-    ordered = sorted(directions or (), key=lambda direction: DIRECTION_EVENT_ORDER_INDEX.get(direction, len(DIRECTION_EVENT_ORDER)))
-    if not ordered:
-        return "--"
-    return "/".join(_debug_direction_label(direction) for direction in ordered)
-
-
-def _format_debug_direction_scores(direction_scores, max_items=7):
-    items = list(direction_scores or ())
-    if not items:
-        return "--"
-    return ",".join(f"{_debug_direction_label(direction)} {compact_score(score)}" for direction, score in items[: int(max_items)])
-
-
-def _format_gunshot_cooldown_debug(display_debug):
-    if display_debug is None:
-        return "--"
-    parts = []
-    if display_debug.gunshot_global_cooldown_blocked_directions:
-        parts.append(f"G:{_format_debug_direction_list(display_debug.gunshot_global_cooldown_blocked_directions)}")
-    if display_debug.gunshot_sector_cooldown_blocked_directions:
-        parts.append(f"S:{_format_debug_direction_list(display_debug.gunshot_sector_cooldown_blocked_directions)}")
-    return ",".join(parts) if parts else "--"
+def _direction_event_debug_config():
+    return DirectionEventDebugConfig(
+        event_thresholds=DIRECTION_EVENT_DISPLAY_THRESHOLDS,
+        secondary_thresholds=DIRECTION_EVENT_SECONDARY_DISPLAY_THRESHOLDS,
+        max_events=DIRECTION_EVENT_MAX_ICONS_PER_DIRECTION,
+        gunshot_bias_margin=DIRECTION_EVENT_GUNSHOT_BIAS_MARGIN,
+        gunshot_max_directions=GUNSHOT_SPATIAL_MAX_DIRECTIONS,
+    )
 
 
 def direction_event_device_label(runtime=None, requested_device=None, resolved_device=None, resolved_dtype=None):
-    if runtime is not None:
-        requested_device = getattr(runtime, "device", requested_device)
-        resolved_device = getattr(runtime, "resolved_device", resolved_device)
-        resolved_dtype = getattr(runtime, "resolved_dtype", resolved_dtype)
-    requested = str(requested_device or "?")
-    if resolved_device:
-        resolved = str(resolved_device)
-        label = resolved if requested == resolved else f"{requested}→{resolved}"
-    else:
-        label = f"{requested}→?" if requested == "auto" else requested
-    return f"{label}/{resolved_dtype}" if resolved_dtype else label
+    return _direction_event_device_label(runtime, requested_device, resolved_device, resolved_dtype)
 
 
 def direction_event_debug_header(
@@ -1054,37 +688,32 @@ def direction_event_debug_header(
     resolved_dtype=None,
     teacher_model=None,
 ):
-    teacher_label = str(teacher_model or AST_DIRECTION_EVENT_TEACHER_MODEL or "teacher")
-    if status is None and requested_device is None and resolved_device is None and resolved_dtype is None:
-        return f"{teacher_label} events"
-    return f"{teacher_label} {status or 'idle'} {direction_event_device_label(requested_device=requested_device, resolved_device=resolved_device, resolved_dtype=resolved_dtype)}"
+    return _direction_event_debug_header(
+        status,
+        requested_device,
+        resolved_device,
+        resolved_dtype,
+        teacher_model,
+        default_teacher_model=AST_DIRECTION_EVENT_TEACHER_MODEL,
+    )
 
 
 def format_latency_ms(value):
-    if value is None:
-        return "--"
-    return f"{max(0.0, float(value)):.0f}ms"
+    return _format_latency_ms(value)
 
 
 def direction_latency_debug_line(radar_latency_ms=None, ast_latency_ms=None):
-    if radar_latency_ms is None or ast_latency_ms is None:
-        delta = "--"
-    else:
-        delta_value = float(ast_latency_ms) - float(radar_latency_ms)
-        sign = "+" if delta_value >= 0 else ""
-        delta = f"{sign}{delta_value:.0f}ms"
-    return f"lag radar {format_latency_ms(radar_latency_ms)} model {format_latency_ms(ast_latency_ms)} Δ{delta}"
+    return _direction_latency_debug_line(radar_latency_ms, ast_latency_ms)
 
 
 def direction_event_debug_cell(direction, scores_by_direction, active_by_direction, threshold=AST_DIRECTION_EVENT_THRESHOLD):
-    label = DIRECTION_DEBUG_LABELS[direction]
-    scores = scores_by_direction.get(direction, {}) or {}
-    events = displayed_active_events(scores, active_by_direction.get(direction, ()), threshold)
-    if not events:
-        return f"{label}: --"
-    event_labels = "/".join(EVENT_DEBUG_LABELS[event_name] for event_name, _ in events)
-    scores_label = "/".join(compact_score(score) for _, score in events)
-    return f"{label}: {event_labels} {scores_label}"
+    return _direction_event_debug_cell(
+        direction,
+        scores_by_direction,
+        active_by_direction,
+        threshold,
+        config=_direction_event_debug_config(),
+    )
 
 
 def direction_event_gunshot_debug_line(
@@ -1092,23 +721,11 @@ def direction_event_gunshot_debug_line(
     display_debug=None,
     threshold=AST_DIRECTION_EVENT_THRESHOLD,
 ):
-    if display_debug is not None:
-        decision = display_debug.gunshot_decision
-        shown_directions = display_debug.gunshot_emitted_directions
-    elif prediction is not None:
-        scores_by_direction = getattr(prediction, "direction_event_scores", {}) or {}
-        active_by_direction = getattr(prediction, "active_events_by_direction", {}) or {}
-        decision = gunshot_display_decision(scores_by_direction, active_by_direction, threshold)
-        shown_directions = tuple(decision.allowed_directions)
-    else:
-        decision = GunshotDisplayDecision(tuple(), frozenset(), frozenset())
-        shown_directions = tuple()
-
-    return (
-        f"gun cand {_format_debug_direction_scores(decision.candidate_scores)} "
-        f"show {_format_debug_direction_list(shown_directions)} "
-        f"sup {_format_debug_direction_list(decision.spatially_suppressed_directions)} "
-        f"cd {_format_gunshot_cooldown_debug(display_debug)}"
+    return _direction_event_gunshot_debug_line(
+        prediction,
+        display_debug,
+        threshold,
+        config=_direction_event_debug_config(),
     )
 
 
@@ -1125,41 +742,21 @@ def direction_event_debug_lines(
     ast_latency_ms=None,
     display_debug=None,
 ):
-    header = direction_event_debug_header(status, requested_device, resolved_device, resolved_dtype, teacher_model)
-    if prediction is None:
-        lines = [
-            header,
-            direction_latency_debug_line(radar_latency_ms, ast_latency_ms),
-            direction_event_gunshot_debug_line(None, display_debug, threshold),
-            "waiting for audio/model...",
-        ]
-        return lines[: int(max_lines)] if max_lines else lines
-
-    scores_by_direction = getattr(prediction, "direction_event_scores", {}) or {}
-    active_by_direction = getattr(prediction, "active_events_by_direction", {}) or {}
-    cell = lambda direction: direction_event_debug_cell(direction, scores_by_direction, active_by_direction, threshold)
-    lines = [
-        header,
-        direction_latency_debug_line(radar_latency_ms, ast_latency_ms),
-        direction_event_gunshot_debug_line(prediction, display_debug, threshold),
-        f"        {cell('front')}",
-        f"{cell('front_left')}    {cell('front_right')}",
-        f"{cell('left')}    {cell('right')}",
-        f"{cell('rear_left')}    {cell('rear_right')}",
-    ]
-    return lines[: int(max_lines)] if max_lines else lines
-
-
-def normalize_degrees(angle):
-    while angle <= -180:
-        angle += 360
-    while angle > 180:
-        angle -= 360
-    return angle
-
-
-def sector_mid_angle_deg(sector):
-    return normalize_degrees(arc_start_deg_for_position(sector) + 15)
+    return _direction_event_debug_lines(
+        prediction,
+        threshold,
+        max_lines,
+        status,
+        requested_device,
+        resolved_device,
+        resolved_dtype,
+        teacher_model,
+        radar_latency_ms,
+        ast_latency_ms,
+        display_debug,
+        config=_direction_event_debug_config(),
+        default_teacher_model=AST_DIRECTION_EVENT_TEACHER_MODEL,
+    )
 
 
 def is_classified_event_kind(kind):
@@ -1176,34 +773,34 @@ def event_icon_center(
     lane_count=1,
     lane_spacing_ratio=EVENT_ICON_STACK_SPACING_RATIO,
 ):
-    angle_rad = math.radians(sector_mid_angle_deg(sector))
-    distance = float(min_side) * float(distance_ratio)
-    lane_count = max(1, int(lane_count))
-    lane_index = clamp(float(lane_index), 0.0, float(lane_count - 1))
-    lane_offset = (lane_index - (lane_count - 1) * 0.5) * float(min_side) * float(lane_spacing_ratio)
-    return QtCore.QPointF(
-        float(center_x) + math.cos(angle_rad) * distance - math.sin(angle_rad) * lane_offset,
-        float(center_y) - math.sin(angle_rad) * distance - math.cos(angle_rad) * lane_offset,
+    x, y = _event_icon_center_xy(
+        sector,
+        min_side,
+        center_x,
+        center_y,
+        distance_ratio=distance_ratio,
+        lane_index=lane_index,
+        lane_count=lane_count,
+        lane_spacing_ratio=lane_spacing_ratio,
     )
+    return QtCore.QPointF(x, y)
 
 
 def event_icon_size(pulse, now, min_side):
-    strength = clamp(float(getattr(pulse, "strength", 0.0)))
-    base_ratio = EVENT_ICON_MIN_SIZE_RATIO + (EVENT_ICON_MAX_SIZE_RATIO - EVENT_ICON_MIN_SIZE_RATIO) * math.sqrt(strength)
-    age = pulse_age_ratio(pulse, now)
-    pop = 1.0 + EVENT_ICON_POP_SCALE * max(0.0, 1.0 - age / EVENT_ICON_POP_AGE_RATIO)
-    return float(min_side) * base_ratio * pop * float(EVENT_ICON_SIZE_SCALE)
+    return _event_icon_size(
+        pulse,
+        now,
+        min_side,
+        min_size_ratio=EVENT_ICON_MIN_SIZE_RATIO,
+        max_size_ratio=EVENT_ICON_MAX_SIZE_RATIO,
+        pop_age_ratio=EVENT_ICON_POP_AGE_RATIO,
+        pop_scale=EVENT_ICON_POP_SCALE,
+        size_scale=EVENT_ICON_SIZE_SCALE,
+    )
 
 
 def event_icon_opacity(pulse, now):
-    age = pulse_age_ratio(pulse, now)
-    if age >= 1.0:
-        return 0.0
-    visibility = 0.68 + 0.32 * clamp(float(getattr(pulse, "strength", 0.0)))
-    if age <= EVENT_ICON_HOLD_AGE_RATIO:
-        return visibility
-    fade = (1.0 - age) / max(1e-6, 1.0 - EVENT_ICON_HOLD_AGE_RATIO)
-    return visibility * (fade ** 1.25)
+    return _event_icon_opacity(pulse, now, hold_age_ratio=EVENT_ICON_HOLD_AGE_RATIO)
 
 
 def event_icon_color(pulse, now):
@@ -1239,50 +836,16 @@ def event_star_polygon(point_count, inner_radius, outer_radius, rotation_deg=90.
     return QtGui.QPolygonF(points)
 
 
-def pulse_ripple_radius(pulse, now, min_side):
-    age = pulse_age_ratio(pulse, now)
-    return min_side * (0.38 + 0.16 * age)
-
-
-def watercolor_pulse_seed(pulse):
-    strength_key = int(round(clamp(float(pulse.strength)) * 1000))
-    time_key = int(round(float(pulse.created_at) * 1000))
-    return ((int(pulse.sector) + 1) * 1_000_003 + time_key * 9_176 + strength_key * 37) & 0xFFFFFFFF
-
-
 def watercolor_blob_specs(pulse, now, min_side, blob_count=WATERCOLOR_BLOBS):
-    age = pulse_age_ratio(pulse, now)
-    strength = clamp(float(pulse.strength))
-    opacity = pulse_opacity(pulse, now)
-    base_distance = max(
-        pulse_ripple_radius(pulse, now, min_side),
-        min_side * WATERCOLOR_INNER_SAFE_RATIO,
+    return _watercolor_blob_specs(
+        pulse,
+        now,
+        min_side,
+        blob_count=blob_count,
+        angle_spread=WATERCOLOR_ANGLE_SPREAD,
+        inner_safe_ratio=WATERCOLOR_INNER_SAFE_RATIO,
+        flow_drift_deg=WATERCOLOR_FLOW_DRIFT_DEG,
     )
-    center_angle = sector_mid_angle_deg(pulse.sector)
-    rng = random.Random(watercolor_pulse_seed(pulse))
-    specs = []
-    for index in range(blob_count):
-        angle_offset = rng.uniform(-WATERCOLOR_ANGLE_SPREAD, WATERCOLOR_ANGLE_SPREAD)
-        flow_deg = rng.uniform(-WATERCOLOR_FLOW_DRIFT_DEG, WATERCOLOR_FLOW_DRIFT_DEG)
-        distance = base_distance + min_side * (0.006 * index + rng.uniform(0.0, 0.026))
-        radius = min_side * rng.uniform(0.038, 0.078) * (0.82 + 0.58 * strength) * (0.9 + 0.28 * age)
-        blob_opacity = clamp(opacity * rng.uniform(0.52, 0.95))
-        specs.append(
-            WatercolorBlob(
-                angle_deg=normalize_degrees(center_angle + angle_offset + flow_deg * (age ** 1.2)),
-                distance=distance,
-                radius=radius,
-                opacity=blob_opacity,
-                stretch=rng.uniform(1.25, 2.15),
-                rotation_deg=normalize_degrees(center_angle + 90 + flow_deg * 0.65 + rng.uniform(-22, 22)),
-                flow_deg=flow_deg,
-            )
-        )
-    return specs
-
-
-def watercolor_color_level(strength):
-    return clamp(float(strength)) ** 2
 
 
 def color_rgba_for_kind(kind, fallback_rgba):
@@ -1318,20 +881,6 @@ def pulse_color(strength, opacity, kind="unknown"):
         rgba = (255, 120, 40, 230)
     red, green, blue, alpha = rgba
     return QtGui.QColor(red, green, blue, int(clamp(alpha * opacity * opacity_multiplier, 0, 255)))
-
-
-def arc_start_deg_for_position(position):
-    """Return QPainter.drawArc start degrees for clock-like radar positions.
-
-    QPainter uses 0° at 3 o'clock and positive angles counter-clockwise.
-    Radar positions are clock-like: 0=front/top, 3=right, 6=rear/bottom, 9=left.
-    """
-    angle = 75 - position * 30
-    while angle <= -180:
-        angle += 360
-    while angle > 180:
-        angle -= 360
-    return angle
 
 
 def centered_top_left(screen_geometry, window_size):
@@ -2027,15 +1576,11 @@ def audio_callback(indata, frames, callback_time, status):
 
 
 def rolling_capture_output_path(directory=None, now=None):
-    timestamp = time.time() if now is None else float(now)
-    base = Path(directory or ROLLING_CAPTURE_DIR).expanduser()
-    local = time.localtime(timestamp)
-    millis = int((timestamp - int(timestamp)) * 1000)
-    return base / f"soundradar-rolling-{time.strftime('%Y%m%d-%H%M%S', local)}-{millis:03d}.wav"
+    return _rolling_capture_output_path(directory or ROLLING_CAPTURE_DIR, now=now)
 
 
 def rolling_capture_metadata_path(audio_path):
-    return Path(audio_path).with_suffix(".json")
+    return _rolling_capture_metadata_path(audio_path)
 
 
 def rolling_capture_metadata_payload(
@@ -2047,31 +1592,21 @@ def rolling_capture_metadata_payload(
     display_debug=None,
     threshold_profile_name=None,
 ):
-    from sound_model.capture_direction_sample import capture_sanity_lines, channel_peak_summary
-
-    audio = np.asarray(snapshot.audio, dtype=np.float32)
-    saved_at = time.time() if saved_at is None else float(saved_at)
-    payload = {
-        "schema_version": 1,
-        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(saved_at)),
-        "audio_path": str(Path(audio_path)),
-        "sample_rate": int(snapshot.sample_rate),
-        "channel_count": int(snapshot.channel_count),
-        "duration_seconds": float(audio.shape[0]) / float(snapshot.sample_rate) if snapshot.sample_rate else 0.0,
-        "start_capture_time": snapshot.start_capture_time,
-        "end_capture_time": snapshot.end_capture_time,
-        "threshold_profile": threshold_profile_name,
-        "peak_summary": channel_peak_summary(audio),
-        "sanity_lines": capture_sanity_lines(audio, expected_channels=snapshot.channel_count),
-    }
+    hud_summary_lines = None
     if prediction is not None:
-        payload["prediction"] = prediction.to_jsonable() if hasattr(prediction, "to_jsonable") else None
-        payload["hud_summary_lines"] = direction_event_debug_lines(
+        hud_summary_lines = direction_event_debug_lines(
             prediction,
             threshold=AST_DIRECTION_EVENT_THRESHOLD,
             display_debug=display_debug,
         )
-    return payload
+    return _rolling_capture_metadata_payload(
+        snapshot,
+        audio_path=audio_path,
+        saved_at=saved_at,
+        prediction=prediction,
+        hud_summary_lines=hud_summary_lines,
+        threshold_profile_name=threshold_profile_name,
+    )
 
 
 def write_rolling_capture_snapshot(
@@ -2083,45 +1618,32 @@ def write_rolling_capture_snapshot(
     display_debug=None,
     threshold_profile_name=None,
 ):
-    from sound_model.audio_features import write_wav
-
-    audio_path = rolling_capture_output_path(directory, now=now)
-    audio_path.parent.mkdir(parents=True, exist_ok=True)
-    write_wav(audio_path, np.asarray(snapshot.audio, dtype=np.float32), snapshot.sample_rate)
-    metadata = rolling_capture_metadata_payload(
+    hud_summary_lines = None
+    if prediction is not None:
+        hud_summary_lines = direction_event_debug_lines(
+            prediction,
+            threshold=AST_DIRECTION_EVENT_THRESHOLD,
+            display_debug=display_debug,
+        )
+    return _write_rolling_capture_snapshot(
         snapshot,
-        audio_path=audio_path,
-        saved_at=now,
+        directory=directory or ROLLING_CAPTURE_DIR,
+        now=now,
         prediction=prediction,
-        display_debug=display_debug,
+        hud_summary_lines=hud_summary_lines,
         threshold_profile_name=threshold_profile_name,
     )
-    metadata_path = rolling_capture_metadata_path(audio_path)
-    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
-    return audio_path, metadata_path
 
 
 def consume_rolling_capture_trigger(path=None):
-    path = Path(path or ROLLING_CAPTURE_TRIGGER_PATH).expanduser()
-    if not str(path):
-        return False
-    if not path.exists():
-        return False
-    try:
-        path.unlink()
-    except OSError:
-        pass
-    return True
+    return _consume_rolling_capture_trigger(path or ROLLING_CAPTURE_TRIGGER_PATH)
 
 
 def write_rolling_capture_trigger(path=None):
-    path = Path(path or ROLLING_CAPTURE_TRIGGER_PATH).expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(str(time.time()), encoding="utf-8")
-    return path
+    return _write_rolling_capture_trigger(path or ROLLING_CAPTURE_TRIGGER_PATH)
 
 
-class DirectionEventRuntime:
+class DirectionEventRuntime(_DirectionEventRuntime):
     def __init__(
         self,
         sample_rate,
@@ -2142,138 +1664,23 @@ class DirectionEventRuntime:
         latency_clock=None,
         warmup=AST_DIRECTION_EVENT_WARMUP,
     ):
-        self.sample_rate = int(sample_rate)
-        self.channel_count = int(channel_count)
-        self.window_seconds = float(window_seconds)
-        self.max_samples = max(1, int(self.sample_rate * self.window_seconds))
-        self.interval_seconds = float(interval_seconds)
-        self.top_k = int(top_k)
-        self.device = device
-        self.dtype = dtype
-        self.attn_implementation = attn_implementation
-        self.compile_model = compile_model
-        self.teacher_model = teacher_model
-        self.model_id = model_id
-        self.channel_map = dict(channel_map) if channel_map is not None else None
-        self._score_fn = score_fn or self._score_with_ast_teacher
-        self._executor = executor or concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="soundradar-ast")
-        self._latency_clock = latency_clock or time.perf_counter
-        self._future = None
-        self._future_capture_time = None
-        self._teacher = None
-        self._warmup_future = None
-        self._last_submit_time = -float("inf")
-        self._audio = np.zeros((0, self.channel_count), dtype=np.float32)
-        self.latest_audio_capture_time = None
-        self.latest_latency_ms = None
-        self.latest_prediction = None
-        self.disabled_reason = None
-        self.resolved_device = None
-        self.resolved_dtype = None
-        if warmup and score_fn is None:
-            self._warmup_future = self._executor.submit(self._warmup_ast_teacher)
-            self.poll_warmup()
-
-    def append_blocks(self, blocks, capture_time=None):
-        prepared = []
-        for block in blocks:
-            audio = np.asarray(block, dtype=np.float32)
-            if audio.ndim == 1:
-                audio = audio[:, None]
-            if audio.ndim != 2 or audio.shape[0] == 0:
-                continue
-            if audio.shape[1] < self.channel_count:
-                padded = np.zeros((audio.shape[0], self.channel_count), dtype=np.float32)
-                padded[:, : audio.shape[1]] = audio
-                audio = padded
-            prepared.append(audio[:, : self.channel_count])
-        if prepared:
-            self._audio = np.concatenate([self._audio, *prepared], axis=0)[-self.max_samples :]
-            if capture_time is not None:
-                self.latest_audio_capture_time = float(capture_time)
-
-    def poll(self):
-        if self._future is None or not self._future.done():
-            return None
-        try:
-            self.latest_prediction = self._future.result()
-            if self._future_capture_time is not None:
-                self.latest_latency_ms = max(0.0, (self._latency_clock() - self._future_capture_time) * 1000.0)
-        except Exception as exc:
-            self.disabled_reason = str(exc)
-            print(f"Direction event teacher disabled: {exc}", file=sys.stderr)
-            self.latest_prediction = None
-        finally:
-            self._future = None
-            self._future_capture_time = None
-        return self.latest_prediction
-
-    def poll_warmup(self):
-        if self._warmup_future is None:
-            return True
-        if not self._warmup_future.done():
-            return False
-        try:
-            self._warmup_future.result()
-        except Exception as exc:
-            self.disabled_reason = str(exc)
-            print(f"Direction event teacher disabled during warmup: {exc}", file=sys.stderr)
-        finally:
-            self._warmup_future = None
-        return self.disabled_reason is None
-
-    def maybe_submit(self, now):
-        prediction = self.poll()
-        self.poll_warmup()
-        if self.disabled_reason is not None or self._future is not None or self._warmup_future is not None:
-            return prediction
-        if self._audio.shape[0] < self.max_samples:
-            return prediction
-        if now - self._last_submit_time < self.interval_seconds:
-            return prediction
-        window = np.array(self._audio, copy=True)
-        self._last_submit_time = now
-        self._future_capture_time = self.latest_audio_capture_time
-        self._future = self._executor.submit(self._score_fn, window, self.sample_rate, self.top_k, "<live>")
-        return self.poll() if self._future.done() else prediction
-
-    def _ensure_ast_teacher(self):
-        from sound_model.ast_teacher import create_audio_event_teacher
-
-        if self._teacher is None:
-            self._teacher = create_audio_event_teacher(
-                self.teacher_model,
-                model_id=self.model_id,
-                device=self.device,
-                dtype=self.dtype,
-                attn_implementation=self.attn_implementation,
-                compile_model=self.compile_model,
-            )
-        resolved_device = str(getattr(self._teacher, "device", self.device))
-        resolved_dtype = str(getattr(self._teacher, "dtype", self.dtype)).replace("torch.", "")
-        if self.resolved_device != resolved_device or self.resolved_dtype != resolved_dtype:
-            self.resolved_device = resolved_device
-            self.resolved_dtype = resolved_dtype
-            print(f"Direction event teacher {self.teacher_model} device: {resolved_device} dtype: {resolved_dtype}")
-        return self._teacher
-
-    def _warmup_ast_teacher(self):
-        teacher = self._ensure_ast_teacher()
-        warmup = getattr(teacher, "warmup_direction_batch", None)
-        if callable(warmup):
-            warmup(sample_rate=self.sample_rate, seconds=self.window_seconds, direction_count=7)
-
-    def _score_with_ast_teacher(self, audio, sample_rate, top_k, source_path):
-        from sound_model.direction_events import score_direction_events
-
-        teacher = self._ensure_ast_teacher()
-        return score_direction_events(
-            audio,
+        super().__init__(
             sample_rate,
-            teacher,
+            channel_count,
+            window_seconds=window_seconds,
+            interval_seconds=interval_seconds,
             top_k=top_k,
-            source_path=source_path,
-            channel_map=self.channel_map,
+            device=device,
+            dtype=dtype,
+            attn_implementation=attn_implementation,
+            compile_model=compile_model,
+            teacher_model=teacher_model,
+            model_id=model_id,
+            channel_map=channel_map,
+            executor=executor,
+            score_fn=score_fn,
+            latency_clock=latency_clock,
+            warmup=warmup,
         )
 
 
@@ -2339,110 +1746,16 @@ def apply_fade(current_value, elapsed_time, decay_rate=2.0):
     return current_value * math.exp(-decay_rate * elapsed_time)
 
 
-def build_channel_mapping(channel_count, output_channel_count=None):
-    if output_channel_count is not None and output_channel_count < 8 and channel_count >= 2:
-        return {
-            FRONT_LEFT: 0,
-            FRONT_RIGHT: 1,
-            CENTER: None,
-            RIGHT: 1,
-            LEFT: 0,
-            REAR_LEFT: 0,
-            REAR_RIGHT: 1,
-        }, "stereo fallback (2-channel output)"
-    if channel_count >= 8:
-        return {
-            FRONT_LEFT: 0,
-            FRONT_RIGHT: 1,
-            CENTER: 2,
-            RIGHT: 5,
-            LEFT: 4,
-            REAR_LEFT: 6,
-            REAR_RIGHT: 7,
-        }, "7.1 surround"
-    if channel_count >= 2:
-        return {
-            FRONT_LEFT: 0,
-            FRONT_RIGHT: 1,
-            CENTER: None,
-            RIGHT: 1,
-            LEFT: 0,
-            REAR_LEFT: 0,
-            REAR_RIGHT: 1,
-        }, "stereo fallback"
-    if channel_count == 1:
-        return {
-            FRONT_LEFT: 0,
-            FRONT_RIGHT: 0,
-            CENTER: 0,
-            RIGHT: 0,
-            LEFT: 0,
-            REAR_LEFT: 0,
-            REAR_RIGHT: 0,
-        }, "mono fallback"
-    raise ValueError("Selected device has no input channels.")
-
-
-def positive_difference(primary, secondary):
-    return max(0.0, float(primary) - float(secondary))
-
-
 def directional_difference(primary, secondary, min_ratio=None):
-    diff = positive_difference(primary, secondary)
-    if diff <= 0:
-        return 0.0
-    min_ratio = maxdifmain if min_ratio is None else min_ratio
-    baseline = min(float(primary), float(secondary))
-    if baseline <= 0:
-        return diff
-    return diff if diff / baseline > min_ratio else 0.0
+    return _directional_difference(primary, secondary, maxdifmain if min_ratio is None else min_ratio)
 
 
 def is_directional_louder(primary, secondary, current_max):
     return directional_difference(primary, secondary) > current_max
 
 
-def centered_pair_strength(first, second, balance_tolerance=0.25):
-    strongest = max(float(first), float(second))
-    if strongest <= 0:
-        return 0.0
-    if abs(float(first) - float(second)) / strongest > balance_tolerance:
-        return 0.0
-    return (float(first) + float(second)) / 2
-
-
-def mapped_channel_value(values, channel_map, key):
-    index = channel_map.get(key)
-    if index is None:
-        return 0.0
-    return float(values[index])
-
-
 def compute_direction_levels(max_values, channel_map):
-    """Map channel peak values to the 12 visual radar sectors."""
-    values = np.asarray(max_values)
-    front_left = mapped_channel_value(values, channel_map, FRONT_LEFT)
-    front_right = mapped_channel_value(values, channel_map, FRONT_RIGHT)
-    center = mapped_channel_value(values, channel_map, CENTER)
-    left = mapped_channel_value(values, channel_map, LEFT)
-    right = mapped_channel_value(values, channel_map, RIGHT)
-    rear_left = mapped_channel_value(values, channel_map, REAR_LEFT)
-    rear_right = mapped_channel_value(values, channel_map, REAR_RIGHT)
-
-    levels = np.zeros(RADAR_SECTORS, dtype=float)
-    levels[0] = max(center, centered_pair_strength(front_left, front_right))
-    levels[1] = directional_difference(front_right, front_left)
-    levels[2] = centered_pair_strength(front_right, right)
-    levels[3] = right
-    levels[4] = centered_pair_strength(right, rear_right)
-    levels[5] = directional_difference(rear_right, rear_left)
-    levels[6] = centered_pair_strength(rear_left, rear_right)
-    levels[7] = directional_difference(rear_left, rear_right)
-    levels[8] = centered_pair_strength(rear_left, left)
-    levels[9] = left
-    levels[10] = centered_pair_strength(left, front_left)
-    levels[11] = directional_difference(front_left, front_right)
-    return levels
+    return _compute_direction_levels(max_values, channel_map, min_ratio=maxdifmain)
 
 
 def update_sector_state(frame, position, candidate, now):

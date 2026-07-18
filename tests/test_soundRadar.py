@@ -64,6 +64,24 @@ class SoundRadarMappingTests(unittest.TestCase):
         self.assertEqual(soundRadar.centered_pair_strength(0.0, 0.8), 0.0)
         self.assertGreater(soundRadar.centered_pair_strength(0.8, 0.75), 0.0)
 
+    def test_direction_levels_still_follow_runtime_directional_ratio(self):
+        mapping, _ = soundRadar.build_channel_mapping(8)
+        values = soundRadar.np.zeros(8)
+        values[mapping[soundRadar.FRONT_LEFT]] = 1.0
+        values[mapping[soundRadar.FRONT_RIGHT]] = 0.99
+        original_ratio = soundRadar.maxdifmain
+
+        try:
+            soundRadar.maxdifmain = 0.02
+            quiet = soundRadar.compute_direction_levels(values, mapping)
+            soundRadar.maxdifmain = 0.001
+            sensitive = soundRadar.compute_direction_levels(values, mapping)
+        finally:
+            soundRadar.maxdifmain = original_ratio
+
+        self.assertEqual(quiet[11], 0.0)
+        self.assertGreater(sensitive[11], 0.0)
+
     def test_direction_levels_keep_rear_left_and_rear_right_distinct(self):
         mapping, _ = soundRadar.build_channel_mapping(16, output_channel_count=16)
         values = soundRadar.np.zeros(16)
@@ -517,6 +535,33 @@ class SoundRadarPulseTests(unittest.TestCase):
         self.assertEqual(pulses[0].kind, "gunshot")
         self.assertAlmostEqual(pulses[0].strength, 0.72)
 
+    def test_direction_event_pulses_follow_runtime_spatial_limit(self):
+        prediction = SimpleNamespace(
+            direction_event_scores={
+                "front": {"gunshot": 0.8},
+                "rear_right": {"gunshot": 0.7},
+            },
+            active_events_by_direction={
+                "front": ["gunshot"],
+                "rear_right": ["gunshot"],
+            },
+        )
+        original_limit = soundRadar.GUNSHOT_SPATIAL_MAX_DIRECTIONS
+
+        try:
+            soundRadar.GUNSHOT_SPATIAL_MAX_DIRECTIONS = 1
+            limited = soundRadar.create_pulses_from_direction_events(prediction, now=10.0, threshold=0.1)
+            soundRadar.GUNSHOT_SPATIAL_MAX_DIRECTIONS = 2
+            expanded = soundRadar.create_pulses_from_direction_events(prediction, now=10.0, threshold=0.1)
+        finally:
+            soundRadar.GUNSHOT_SPATIAL_MAX_DIRECTIONS = original_limit
+
+        self.assertEqual([pulse.sector for pulse in limited], [soundRadar.DIRECTION_EVENT_SECTORS["front"]])
+        self.assertEqual(
+            {pulse.sector for pulse in expanded},
+            {soundRadar.DIRECTION_EVENT_SECTORS["front"], soundRadar.DIRECTION_EVENT_SECTORS["rear_right"]},
+        )
+
     def test_direction_event_prediction_keeps_distant_low_score_gunshot_local_maximum(self):
         prediction = SimpleNamespace(
             direction_event_scores={
@@ -728,6 +773,20 @@ class SoundRadarPulseTests(unittest.TestCase):
             soundRadar.event_icon_center(strong.sector, 720, 360, 360),
         )
 
+    def test_event_icon_size_follows_runtime_scale(self):
+        pulse = soundRadar.SoundPulse(sector=1, strength=0.8, created_at=10.0, kind="gunshot")
+        original_scale = soundRadar.EVENT_ICON_SIZE_SCALE
+
+        try:
+            soundRadar.EVENT_ICON_SIZE_SCALE = 1.0
+            normal = soundRadar.event_icon_size(pulse, now=10.1, min_side=720)
+            soundRadar.EVENT_ICON_SIZE_SCALE = 1.25
+            enlarged = soundRadar.event_icon_size(pulse, now=10.1, min_side=720)
+        finally:
+            soundRadar.EVENT_ICON_SIZE_SCALE = original_scale
+
+        self.assertAlmostEqual(enlarged, normal * 1.25)
+
     def test_event_icon_opacity_holds_before_fading(self):
         pulse = soundRadar.SoundPulse(sector=1, strength=0.8, created_at=10.0, duration=soundRadar.EVENT_ICON_DURATION, kind="gunshot")
 
@@ -807,6 +866,30 @@ class SoundRadarPulseTests(unittest.TestCase):
         self.assertIn("show --", lines[2])
         self.assertIn("sup F/R", lines[2])
         self.assertIn("cd G:FR", lines[2])
+
+    def test_direction_event_debug_line_follows_runtime_spatial_limit(self):
+        prediction = SimpleNamespace(
+            direction_event_scores={
+                "front": {"gunshot": 0.8},
+                "rear_right": {"gunshot": 0.7},
+            },
+            active_events_by_direction={
+                "front": ["gunshot"],
+                "rear_right": ["gunshot"],
+            },
+        )
+        original_limit = soundRadar.GUNSHOT_SPATIAL_MAX_DIRECTIONS
+
+        try:
+            soundRadar.GUNSHOT_SPATIAL_MAX_DIRECTIONS = 1
+            limited = soundRadar.direction_event_gunshot_debug_line(prediction, threshold=0.1)
+            soundRadar.GUNSHOT_SPATIAL_MAX_DIRECTIONS = 2
+            expanded = soundRadar.direction_event_gunshot_debug_line(prediction, threshold=0.1)
+        finally:
+            soundRadar.GUNSHOT_SPATIAL_MAX_DIRECTIONS = original_limit
+
+        self.assertIn("show F ", limited)
+        self.assertIn("show F/RR ", expanded)
 
     def test_direction_event_runtime_device_label_shows_mps_resolution(self):
         runtime = soundRadar.DirectionEventRuntime(sample_rate=16_000, channel_count=8, device="auto", warmup=False)
