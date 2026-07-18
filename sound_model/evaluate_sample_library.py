@@ -16,6 +16,7 @@ from .capture_direction_sample_gui import (
 )
 from .ast_teacher import create_audio_event_teacher, load_audio_channels
 from .direction_events import score_direction_events
+from .sample_library import read_library
 
 
 EVALUATION_FIELDS = (
@@ -494,7 +495,7 @@ def evaluate_sample_library_rows(
     limit: int | None = None,
 ) -> list[dict[str, str]]:
     library_path = Path(library_path)
-    records = read_sample_library(library_path)
+    records = [record for record in read_library(library_path) if record.get("review_status") == "reviewed"]
     if limit is not None:
         records = records[: int(limit)]
     if not records:

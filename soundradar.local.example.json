@@ -9,7 +9,7 @@
   "interval_seconds": 0.5,
   "warmup": true,
   "rolling_capture_enabled": true,
-  "rolling_capture_seconds": 5.0,
+  "rolling_capture_seconds": 10.0,
   "rolling_capture_dir": "~/SoundRadarSamples/rolling",
   "rolling_capture_trigger_path": "/tmp/soundradar-save-rolling",
   "event_icon_labels": false,

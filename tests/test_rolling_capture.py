@@ -59,6 +59,16 @@ class RollingCaptureHelperTests(unittest.TestCase):
             self.assertTrue(consumed)
             self.assertFalse(path.exists())
 
+    def test_snapshot_can_return_only_requested_recent_seconds(self):
+        capture = rolling_capture.RollingAudioCapture(sample_rate=10, channel_count=1, seconds=2.0)
+        capture.append_blocks([np.arange(20, dtype=np.float32)[:, None]], capture_time=20.0)
+
+        snapshot = capture.snapshot(seconds=0.5)
+
+        self.assertEqual(snapshot.audio.shape, (5, 1))
+        np.testing.assert_array_equal(snapshot.audio[:, 0], np.arange(15, 20, dtype=np.float32))
+        self.assertAlmostEqual(snapshot.start_capture_time, 19.5)
+
 
 if __name__ == "__main__":
     unittest.main()

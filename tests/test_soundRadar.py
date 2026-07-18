@@ -1072,6 +1072,43 @@ class SoundRadarRuntimeConfigTests(unittest.TestCase):
 
 
 class SoundRadarRollingCaptureTests(unittest.TestCase):
+    def test_request_protocol_returns_real_inbox_wav_and_matching_id(self):
+        from pathlib import Path
+        from sound_model.capture_protocol import consume_capture_result, new_capture_request, write_capture_request
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            request_path = Path(tmpdir) / "capture-request.json"
+            rolling_dir = Path(tmpdir) / "rolling"
+            capture = soundRadar.RollingAudioCapture(sample_rate=10, channel_count=2, seconds=2.0)
+            capture.append_blocks([soundRadar.np.ones((20, 2), dtype=soundRadar.np.float32) * 0.1], capture_time=10.0)
+            radar = SimpleNamespace(
+                rolling_capture=capture,
+                latest_direction_event_prediction=None,
+                latest_direction_event_display_debug=None,
+                threshold_profile_name="default",
+            )
+            request = new_capture_request(
+                capture_seconds=0.5,
+                provisional_tag="gunshot",
+                trigger="F8",
+            )
+            write_capture_request(request_path, request)
+            with patch.object(soundRadar, "ROLLING_CAPTURE_TRIGGER_PATH", str(request_path)), patch.object(
+                soundRadar, "ROLLING_CAPTURE_DIR", str(rolling_dir)
+            ):
+                saved = soundRadar.maybe_save_rolling_capture(radar, now=12.5)
+                result = consume_capture_result(request_path, request.request_id)
+
+            self.assertIsNotNone(saved)
+            self.assertTrue(result.success)
+            self.assertEqual(result.request_id, request.request_id)
+            self.assertTrue(Path(result.audio_path).exists())
+            self.assertEqual(Path(result.audio_path).parent.name, "inbox")
+            metadata = json.loads(Path(result.metadata_path).read_text(encoding="utf-8"))
+            self.assertEqual(metadata["provisional_tag"], "gunshot")
+            self.assertEqual(metadata["review_status"], "pending")
+            self.assertAlmostEqual(metadata["duration_seconds"], 0.5)
+
     def test_rolling_audio_capture_keeps_recent_window(self):
         capture = soundRadar.RollingAudioCapture(sample_rate=10, channel_count=2, seconds=0.3)
         capture.append_blocks([soundRadar.np.ones((4, 2), dtype=soundRadar.np.float32)], capture_time=10.0)

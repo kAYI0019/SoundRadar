@@ -25,6 +25,7 @@ from .ast_teacher import (
     create_audio_event_teacher,
     event_label_evidence_from_scores,
     load_audio_channels,
+    normalize_teacher_model_choice,
 )
 from .audio_features import DEFAULT_CLASSES
 from .vehicle_gun_resolver import (
@@ -241,6 +242,9 @@ class DirectionEventPrediction:
     vehicle_gun_decisions_by_direction: dict[str, VehicleGunDecision] = field(default_factory=dict)
     label_score_semantics_by_direction: dict[str, str] = field(default_factory=dict)
     inference_latency_ms: float | None = None
+    requested_model: str | None = None
+    loaded_model: str | None = None
+    analysis_device: str | None = None
 
     def to_jsonable(self) -> dict[str, object]:
         return {
@@ -266,6 +270,9 @@ class DirectionEventPrediction:
             },
             "label_score_semantics_by_direction": self.label_score_semantics_by_direction,
             "inference_latency_ms": self.inference_latency_ms,
+            "requested_model": self.requested_model,
+            "loaded_model": self.loaded_model,
+            "analysis_device": self.analysis_device,
         }
 
 
@@ -463,7 +470,21 @@ def predict_direction_events_file(
         attn_implementation=attn_implementation,
         compile_model=compile_model,
     )
-    return score_direction_events(audio, sample_rate, teacher, top_k=top_k, source_path=str(path))
+    prediction = score_direction_events(audio, sample_rate, teacher, top_k=top_k, source_path=str(path))
+    backend, resolved_model_id = normalize_teacher_model_choice(teacher_model, model_id=model_id)
+    requested_model = "ast" if backend == "ast" else {
+        "mn10_as": "efficientat-mn10",
+        "mn20_as": "efficientat-mn20",
+    }.get(str(resolved_model_id), f"efficientat:{resolved_model_id}")
+    actual_model_id = str(getattr(teacher, "model_id", resolved_model_id))
+    loaded_model = "ast" if backend == "ast" and actual_model_id == str(resolved_model_id) else {
+        "mn10_as": "efficientat-mn10",
+        "mn20_as": "efficientat-mn20",
+    }.get(actual_model_id, f"{backend}:{actual_model_id}")
+    prediction.requested_model = requested_model
+    prediction.loaded_model = loaded_model
+    prediction.analysis_device = str(getattr(teacher, "device", device))
+    return prediction
 
 
 def build_parser() -> argparse.ArgumentParser:

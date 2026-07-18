@@ -102,19 +102,20 @@ through the direction-event teacher:
 .venv/bin/python -m sound_model.capture_direction_sample_gui
 ```
 
-The capture GUI lets you pick the input device, duration, channel count, and WAV
-output path. After recording, click **Analyze** to run the direction-event
-teacher and show the HUD-style `gun cand/show/sup/cd` summary plus direction
-scores in the GUI log. Analysis also writes a `*.analysis.json` file next to the
-WAV with the peak summary, teacher settings, HUD lines, direction scores, and
-gunshot display decisions. Click **Compare Profiles** to write a
+The capture GUI separates the Korean result summary, direction table, profile
+comparison, review queue, evaluation, and raw developer log into tabs. Analysis
+also writes a backward-compatible schema-v2 `*.analysis.json` file next to the
+WAV. It records the requested model, actually loaded model, device, primary
+event/direction, warnings, detailed scores, and the legacy teacher/HUD fields.
+Click **프로필 비교** to write a
 `*.profile-comparison.json` file and compare `default`, `quiet`, `aggressive`,
-and `debug` display behavior from the same teacher prediction. Use the **Tag**
-row to append the current sample to a CSV library as `gunshot`, `vehicle`,
-`footstep`, `unknown`, or `bad sample`. The GUI also shows device/channel sanity
-messages and warns when an 8+ channel recording only contains stereo-like signal.
-If the live overlay is running, **Save Last 5s** creates the rolling-capture
-trigger file for the overlay, so you do not need to run `touch` manually.
+and `debug` display behavior. Reviewed labels update the existing CSV record
+instead of appending a duplicate; `gunshot + vehicle` is supported. Legacy CSV
+rows remain readable. If the live overlay is running, F8/F9/F10 save a pending
+5-second gunshot/vehicle/unknown sample and F11 saves a pending 10-second review
+sample. The GUI waits for the matching result ID, connects the real WAV, and
+adds it to the review queue. These shortcuts are application-wide while the GUI
+is running; OS-global registration is not included yet.
 The same capture path is available as a CLI:
 
 ```sh

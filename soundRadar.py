@@ -114,6 +114,11 @@ from sound_model.rolling_capture import (
     write_rolling_capture_snapshot as _write_rolling_capture_snapshot,
     write_rolling_capture_trigger as _write_rolling_capture_trigger,
 )
+from sound_model.capture_protocol import (
+    CaptureResult,
+    consume_capture_request,
+    write_capture_result,
+)
 
 # GLOBAL PARAMETERS (kept as simple module settings for easy tuning)
 n_chans = 8
@@ -186,7 +191,7 @@ GUNSHOT_SPATIAL_MAX_DIRECTIONS = DEFAULT_GUNSHOT_MAX_DIRECTIONS
 GUNSHOT_GLOBAL_COOLDOWN = DEFAULT_GUNSHOT_GLOBAL_COOLDOWN
 
 ROLLING_CAPTURE_ENABLED = True
-ROLLING_CAPTURE_SECONDS = 5.0
+ROLLING_CAPTURE_SECONDS = 10.0
 ROLLING_CAPTURE_DIR = str(Path.home() / "SoundRadarSamples" / "rolling")
 ROLLING_CAPTURE_TRIGGER_PATH = "/tmp/soundradar-save-rolling"
 
@@ -1626,6 +1631,7 @@ def write_rolling_capture_snapshot(
     prediction=None,
     display_debug=None,
     threshold_profile_name=None,
+    request=None,
 ):
     hud_summary_lines = None
     if prediction is not None:
@@ -1641,6 +1647,7 @@ def write_rolling_capture_snapshot(
         prediction=prediction,
         hud_summary_lines=hud_summary_lines,
         threshold_profile_name=threshold_profile_name,
+        request=request,
     )
 
 
@@ -1813,22 +1820,74 @@ def update_rolling_capture(radarObject, audio_blocks, capture_time=None):
 
 def maybe_save_rolling_capture(radarObject, now):
     rolling_capture = getattr(radarObject, "rolling_capture", None)
-    if rolling_capture is None or not consume_rolling_capture_trigger():
+    request = consume_capture_request(ROLLING_CAPTURE_TRIGGER_PATH)
+    legacy_trigger = False if request is not None else consume_rolling_capture_trigger()
+    if request is None and not legacy_trigger:
         return None
-    snapshot = rolling_capture.snapshot()
+    if rolling_capture is None:
+        if request is not None:
+            write_capture_result(
+                ROLLING_CAPTURE_TRIGGER_PATH,
+                CaptureResult(
+                    request_id=request.request_id,
+                    success=False,
+                    error_code="ROLLING_BUFFER_UNAVAILABLE",
+                    message="실시간 롤링 오디오 버퍼를 사용할 수 없습니다.",
+                ),
+            )
+        return None
+    snapshot = rolling_capture.snapshot(request.capture_seconds if request is not None else None)
     if np.asarray(snapshot.audio).size == 0:
         print("Rolling capture trigger ignored: no audio buffered yet.", file=sys.stderr)
+        if request is not None:
+            write_capture_result(
+                ROLLING_CAPTURE_TRIGGER_PATH,
+                CaptureResult(
+                    request_id=request.request_id,
+                    success=False,
+                    error_code="ROLLING_BUFFER_UNAVAILABLE",
+                    message="실시간 롤링 오디오 버퍼를 사용할 수 없습니다.",
+                ),
+            )
         return None
-    audio_path, metadata_path = write_rolling_capture_snapshot(
-        snapshot,
-        directory=ROLLING_CAPTURE_DIR,
-        now=now,
-        prediction=getattr(radarObject, "latest_direction_event_prediction", None),
-        display_debug=getattr(radarObject, "latest_direction_event_display_debug", None),
-        threshold_profile_name=getattr(radarObject, "threshold_profile_name", None),
-    )
+    output_directory = Path(ROLLING_CAPTURE_DIR).parent / "inbox" if request is not None else Path(ROLLING_CAPTURE_DIR)
+    try:
+        audio_path, metadata_path = write_rolling_capture_snapshot(
+            snapshot,
+            directory=output_directory,
+            now=now,
+            prediction=getattr(radarObject, "latest_direction_event_prediction", None),
+            display_debug=getattr(radarObject, "latest_direction_event_display_debug", None),
+            threshold_profile_name=getattr(radarObject, "threshold_profile_name", None),
+            request=request,
+        )
+    except Exception as exc:
+        if request is not None:
+            write_capture_result(
+                ROLLING_CAPTURE_TRIGGER_PATH,
+                CaptureResult(
+                    request_id=request.request_id,
+                    success=False,
+                    error_code="CAPTURE_WRITE_FAILED",
+                    message=str(exc),
+                ),
+            )
+            return None
+        raise
     print(f"Rolling capture saved: {audio_path}")
     print(f"Rolling capture metadata: {metadata_path}")
+    if request is not None:
+        metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+        write_capture_result(
+            ROLLING_CAPTURE_TRIGGER_PATH,
+            CaptureResult(
+                request_id=request.request_id,
+                success=True,
+                audio_path=str(audio_path),
+                metadata_path=str(metadata_path),
+                sample_id=str(metadata.get("sample_id", "")),
+            ),
+        )
     return audio_path, metadata_path
 
 

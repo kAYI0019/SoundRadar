@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -8,11 +9,44 @@ from sound_model.direction_events import (
     build_parser,
     extract_direction_waveforms,
     score_direction_events,
+    predict_direction_events_file,
     top_labels_include_road_vehicle,
 )
 
 
 class DirectionEventScoreTests(unittest.TestCase):
+    def test_file_prediction_records_requested_and_actual_loaded_model(self):
+        audio = np.ones((16, 8), dtype=np.float32) * 0.1
+
+        class Teacher:
+            model_id = "mn10_as"
+            device = "mps:0"
+
+            def predict_waveforms(self, waveforms, sample_rate, *, top_k=12, audio_paths=None):
+                return [
+                    SimpleNamespace(
+                        top_labels=[],
+                        soundradar_events={
+                            "background": 1.0,
+                            "footstep": 0.0,
+                            "gunshot": 0.0,
+                            "vehicle": 0.0,
+                            "explosion": 0.0,
+                        },
+                    )
+                    for _ in waveforms
+                ]
+
+        with patch("sound_model.direction_events.load_audio_channels", return_value=(audio, 48000)), patch(
+            "sound_model.direction_events.create_audio_event_teacher", return_value=Teacher()
+        ):
+            prediction = predict_direction_events_file("/tmp/sample.wav", teacher_model="efficientat-mn10", device="mps")
+
+        self.assertEqual(prediction.requested_model, "efficientat-mn10")
+        self.assertEqual(prediction.loaded_model, "efficientat-mn10")
+        self.assertEqual(prediction.analysis_device, "mps:0")
+        self.assertEqual(prediction.to_jsonable()["loaded_model"], "efficientat-mn10")
+
     def test_extract_direction_waveforms_uses_audio_midi_7_1_order(self):
         audio = np.stack([np.full(5, channel, dtype=np.float32) for channel in range(8)], axis=1)
 
